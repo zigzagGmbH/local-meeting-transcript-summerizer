@@ -4,9 +4,11 @@ Master Orchestrator for the Meeting Summarization Pipeline.
 Processes an RTF transcript through cleanup, mapping, extraction, and formatting.
 """
 
-import argparse
+import os
 import sys
+import argparse
 from pathlib import Path
+from dotenv import load_dotenv
 
 # Import the core functions from our pipeline modules
 from pipeline.step1_convert import convert
@@ -17,6 +19,15 @@ from pipeline.step5_formatter import format_summary
 
 
 def main():
+    # Load environment variables
+    load_dotenv()
+
+    # Strictly enforce the presence of OLLAMA_HOST
+    ollama_host = os.environ.get("OLLAMA_HOST")
+    if not ollama_host:
+        print("Error: OLLAMA_HOST is missing. Please define it in a .env file.")
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(
         description="End-to-end Local LLM Meeting Summarizer."
     )
@@ -28,14 +39,16 @@ def main():
     parser.add_argument(
         "--out-dir", type=Path, default=Path("./output"), help="Base output directory"
     )
+
+    # FIX: Use the .env variable as the default here!
     parser.add_argument(
         "--host",
         type=str,
-        default="http://192.168.178.160:11434",
+        default=ollama_host,
         help="Ollama host URL",
     )
 
-    # Model Selection Options (Allowing the Mix-and-Match strategy)
+    # Model Selection Options
     parser.add_argument(
         "--cleanup-model",
         type=str,

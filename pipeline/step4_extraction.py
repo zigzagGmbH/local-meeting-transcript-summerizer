@@ -13,10 +13,8 @@ from ollama import Client, ResponseError
 
 # --- Global Configurations ---
 DEFAULT_MODEL = "gemma4:26b"  # Change to "qwen3.5:27b" or "gemma4:26b" based on your preference
-DEFAULT_HOST = "http://192.168.178.160:11434"
 
 # --- Prompts ---
-
 PROMPT_GEMMA = """
 You are an expert executive assistant. Your task is to perform a comprehensive, high-fidelity extraction of information from a meeting transcript.
 
@@ -144,6 +142,19 @@ def extract_information(input_md: Path, out_dir: Path, model: str, host: str) ->
 
 
 def main():
+    # --- ADDED: Load .env when running as a standalone script ---
+    import os
+    from dotenv import load_dotenv
+    
+    load_dotenv()
+    
+    # Strictly enforce the presence of OLLAMA_HOST (No fallback)
+    ollama_host = os.environ.get("OLLAMA_HOST")
+    if not ollama_host:
+        print("Error: OLLAMA_HOST is missing. Please define it in a .env file.")
+        sys.exit(1)
+    # ------------------------------------------------------------
+    
     parser = argparse.ArgumentParser(
         description="Extract key info from a named transcript using Ollama."
     )
@@ -160,8 +171,8 @@ def main():
     parser.add_argument(
         "--host",
         type=str,
-        default=DEFAULT_HOST,
-        help=f"Ollama host URL (default: {DEFAULT_HOST})",
+        default=ollama_host,                      
+        help=f"Ollama host URL (default: {ollama_host})",
     )
 
     args = parser.parse_args()

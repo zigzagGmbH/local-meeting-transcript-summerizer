@@ -11,6 +11,9 @@ wheels/
 *.tmp
 *.bak
 
+# Environment file
+.env
+
 # Virtual environments
 .venv
 

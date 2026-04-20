@@ -2,7 +2,8 @@
 
 ## Description
 
-A multi-agent, privacy-first pipeline that transforms raw `.rtf` meeting transcripts from [Moonshine.ai](https://note-taker.moonshine.ai/) into polished, corporate-grade meeting minutes using local LLMs (like Gemma4 and Qwen) via Ollama.
+> [!Warning]
+A multi-agent, privacy-first pipeline that transforms raw `.rtf` meeting transcripts from [Moonshine.ai](https://note-taker.moonshine.ai/) (CURRENTLY only for moonshine. Our transcriber's transcript handling is planned. _See at the bottom_) into polished, corporate-grade meeting minutes using local LLMs (like Gemma4 and Qwen) via Ollama.
 
 ## Overview
 
@@ -34,7 +35,8 @@ During the development of this pipeline, several critical discoveries shaped the
   # on a mac it would be, after installing uv
   uv sync
   ```
-* **[Ollama](https://ollama.com/)** running locally or on your network (Default expects: `http://<YOUR OLLAMA IP>:<YOUR OLLAMA PORT>`)
+* **Environment Variables**: You MUST create a `.env` (see [.env.template](.env.template)) file in the root directory containing your Ollama host address. The pipeline will not run without it.
+  * **[Ollama](https://ollama.com/)** running locally or on your network (Default expects: `http://<YOUR OLLAMA IP>:<YOUR OLLAMA PORT>`)
 * **Local Models:** Pull your preferred models in Ollama:
   
   ```bash
@@ -97,7 +99,7 @@ uv run step5_formatter.py output/extracted_files/<MeetingTranscript_extracted>.m
 
 ---
 
-## ⚙️ Advanced CLI Usage
+## Advanced CLI Usage
 
 All AI agents (`02`, `04`, `05`) support CLI overrides for the model and the host URL. The scripts will automatically detect if you are using a Gemma or Qwen model and apply the optimized system prompt.
 
@@ -138,18 +140,28 @@ uv run step2_cleanup.py input.md --host http://<your_ollama_host_ADDR>:<your_oll
 
 ### Batch Processing and Chaining
 
-Because every step in this pipeline is an isolated CLI command with distinct input/output directories, you can easily wrap these commands into a simple bash script (`.sh`). This allows you to process multiple transcripts sequentially, only halting the script for the human-in-the-loop speaker mapping ([Step 3](#step-3-speaker-mapping-human-in-the-loop)).
+### 🚀 The Master Orchestrator (main.py)
+
+Because every step in this pipeline is modular, you do not need to run the individual scripts one by one. You can use the master orchestrator to run the entire pipeline end-to-end. 
+
+It will automatically build the output directories, process the transcript, pause to ask you for speaker names, and then generate the final summary.
+
+```bash
+# Run the full pipeline with default models
+uv run main.py transcripts/MeetingTranscript.rtf
+
+# Run the full pipeline using the Mix-and-Match model strategy
+uv run main.py transcripts/MeetingTranscript.rtf \
+    --editor-model gemma4:26b \
+    --extractor-model qwen3.5:27b
+```
 
 
 ## Directory Structure
 
 ```txt
 .
-├── step1_convert.py
-├── step2_cleanup.py
-├── step3_mapping.py
-├── step4_extraction.py
-├── step5_formatter.py
+├── main.py
 ├── output
 │   ├── cleaned_files
 │   │   └── README.md
@@ -161,6 +173,13 @@ Because every step in this pipeline is an isolated CLI command with distinct inp
 │   │   └── README.md
 │   └── raw_files
 │       └── README.md
+├── pipeline
+│   ├── __init__.py
+│   ├── step1_convert.py
+│   ├── step2_cleanup.py
+│   ├── step3_mapping.py
+│   ├── step4_extraction.py
+│   └── step5_formatter.py
 ├── pyproject.toml
 ├── README.md
 ├── transcripts
@@ -171,6 +190,15 @@ Because every step in this pipeline is an isolated CLI command with distinct inp
 ## License
 
 [MIT](License)
+
+---
+
+## ToDo
+
+- [ ] Core Business logic extensions (to be able to account for our transcribers output too)
+  - [ ] Can it take a .md at first, skipping first step of conversion (by auto detecting .rtf or other formats vs .md)?
+  - [ ] How can we account for our transcriber’s diarization pattern (export would be .md - requiring cleanup) and moonshine’s pattern of .rtf, with diff diarization pattern. 
+  - [ ] Can it parse based on speaker ID as well as name, so the human in the loop step won't be necessary as our transcriber can already do speaker renaming and mapping 
 
 ---
 

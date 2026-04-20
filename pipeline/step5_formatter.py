@@ -13,10 +13,8 @@ from ollama import Client, ResponseError
 
 # --- Global Configurations ---
 DEFAULT_MODEL = "gemma4:26b"
-DEFAULT_HOST = "http://192.168.178.160:11434"
 
 # --- Prompts ---
-
 PROMPT_GEMMA = """
 You are an expert technical writer and executive assistant. Your task is to format a raw meeting extraction into a final, polished Markdown document.
 
@@ -138,6 +136,19 @@ def format_summary(input_md: Path, out_dir: Path, model: str, host: str) -> Path
 
 
 def main():
+    # --- ADDED: Load .env when running as a standalone script ---
+    import os
+    from dotenv import load_dotenv
+    
+    load_dotenv()
+    
+    # Strictly enforce the presence of OLLAMA_HOST (No fallback)
+    ollama_host = os.environ.get("OLLAMA_HOST")
+    if not ollama_host:
+        print("Error: OLLAMA_HOST is missing. Please define it in a .env file.")
+        sys.exit(1)
+    # ------------------------------------------------------------
+    
     parser = argparse.ArgumentParser(
         description="Format extracted data into a polished meeting summary using Ollama."
     )
@@ -156,8 +167,8 @@ def main():
     parser.add_argument(
         "--host",
         type=str,
-        default=DEFAULT_HOST,
-        help=f"Ollama host URL (default: {DEFAULT_HOST})",
+        default=ollama_host,                      
+        help=f"Ollama host URL (default: {ollama_host})",
     )
 
     args = parser.parse_args()

@@ -1,5 +1,5 @@
 [project]
-name = "moondshine-rtf-exp-to-better-format"
+name = "local-meeting-transcript-summerizer"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
