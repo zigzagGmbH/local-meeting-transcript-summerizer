@@ -103,7 +103,10 @@ def convert(rtf_path: Path, out_dir: Path) -> tuple[Path, Path]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    doc_lines = (__doc__ or "").splitlines()
+    ap = argparse.ArgumentParser(
+        description=doc_lines[1] if len(doc_lines) > 1 else ""
+    )
     ap.add_argument("rtf", type=Path, help="Input .rtf transcript")
     ap.add_argument(
         "--out-dir",
