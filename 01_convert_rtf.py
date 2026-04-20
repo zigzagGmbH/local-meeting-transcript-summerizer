@@ -36,11 +36,13 @@ def parse_turns(plain_text: str) -> list[dict]:
         if current_speaker and buffer:
             text = " ".join(s.strip() for s in buffer if s.strip())
             if text:
-                turns.append({
-                    "index": len(turns),
-                    "speaker": current_speaker,
-                    "text": text,
-                })
+                turns.append(
+                    {
+                        "index": len(turns),
+                        "speaker": current_speaker,
+                        "text": text,
+                    }
+                )
 
     for raw in plain_text.splitlines():
         line = raw.strip()
@@ -71,8 +73,8 @@ def build_json(turns: list[dict], source_name: str) -> dict:
     return {
         "source": source_name,
         "n_turns": len(turns),
-        "speakers": sorted(speaker_counts.keys(),
-                           key=lambda s: int(s.split()[-1])),
+        "speakers": sorted(speaker_counts.keys(), 
+                        key=lambda s: int(s.split()[-1])),
         "turns_per_speaker": dict(speaker_counts),
         "word_count": word_count,
         "turns": turns,
@@ -84,8 +86,9 @@ def convert(rtf_path: Path, out_dir: Path) -> tuple[Path, Path]:
     plain = rtf_to_text(rtf_text, errors="ignore")
     turns = parse_turns(plain)
     if not turns:
-        raise SystemExit(f"No speaker turns found in {rtf_path}. "
-                         "Is this really a moonshine RTF?")
+        raise SystemExit(
+            f"No speaker turns found in {rtf_path}. " "Is this really a moonshine RTF?"
+        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"{rtf_path.stem}.json"
@@ -102,8 +105,12 @@ def convert(rtf_path: Path, out_dir: Path) -> tuple[Path, Path]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument("rtf", type=Path, help="Input .rtf transcript")
-    ap.add_argument("--out-dir", type=Path, default=Path("."),
-                    help="Output directory (default: cwd)")
+    ap.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("."),
+        help="Output directory (default: cwd)",
+    )
     args = ap.parse_args()
 
     json_path, md_path = convert(args.rtf, args.out_dir)
