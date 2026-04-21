@@ -10,15 +10,15 @@ Run:
 
 Then open http://localhost:7860 in a browser.
 
-Status: M6 complete · M6.5 in progress.
-Current pass (M6.5): S1 Copy-as-markdown-source, S2 top banner accordion,
-S3 stable intermediate filenames. Layout-touching items (M1, M2, L1) are
-deferred to a wireframe round later in this milestone.
+Status: M6 complete · M6.5 in progress (theme integration + raw/render toggle
++ sidebar compaction pass on top of L1+M1+M2).
 """
 
 from __future__ import annotations
 
 import atexit
+import contextlib
+import io
 import os
 import shutil
 import signal
@@ -73,6 +73,24 @@ UPLOAD_MAX_SIZE = "10mb"
 # the outside — it only affects files inside the session tempdir.
 STABLE_STEM = "transcript"
 
+# Log panel height in lines (M6.5 L1). 12 lines ≈ one Ollama step's worth of
+# prints visible at once. Past 12, the Textbox scrolls and autoscroll keeps
+# the latest line in view unless the user manually scrolls up.
+LOG_PANEL_LINES = 12
+
+# Fixed height of the transcript preview AND the final summary render boxes
+# in pixels. gr.Markdown(height=N, max_height=N) + container=True gives a
+# theme-bordered box that scrolls internally past N pixels. Same height on
+# both so the rendered vs raw toggle doesn't make the page jump.
+PREVIEW_HEIGHT = 400
+SUMMARY_HEIGHT = 500
+
+# Raw summary textbox rows when "Raw" view is selected. Roughly matches the
+# SUMMARY_HEIGHT pixel target — Gradio Textbox sizes by line count rather
+# than CSS height, so there's no perfect correspondence; 20 lines is close
+# enough that the radio toggle doesn't produce visible jumps.
+SUMMARY_RAW_LINES = 20
+
 
 # ─── Process-level tracking for shutdown hooks ────────────────────────────
 
@@ -82,6 +100,82 @@ STABLE_STEM = "transcript"
 # and `docker stop` (SIGTERM). Not bulletproof against `kill -9` — see spec
 # risks table.
 _ALL_MODELS_EVER_LOADED: set[tuple[str, str]] = set()
+
+
+# ─── Custom CSS (M6.5 L1 + M1 + theme integration) ───────────────────────
+
+# Injected via demo.launch(css=...). Two scopes:
+#
+#   .log-panel textarea — monospace + smaller font for the CLI-style log
+#   Textbox. elem_classes=["log-panel"] selects the wrapper; the actual
+#   <textarea> is a descendant.
+#
+#   .progress-* — styles for the custom gr.HTML progress bar.
+#
+# Color strategy: theme-aware with hardcoded fallbacks. ``--color-accent``
+# is Gradio's canonical accent-color var (populated from the theme's
+# ``primary`` palette). Nymbo_Theme sets this to #11ba88 (green). The
+# fallback #11ba88 matches Nymbo explicitly in case the var isn't set for
+# a given theme. ``--font-mono`` pulls the theme's mono font stack; Nymbo
+# provides JetBrains Mono here.
+#
+# Error + cancelled fills stay hardcoded (red #ef4444, amber #f59e0b)
+# because theme accent palettes don't have semantically correct slots for
+# these states — using accent for everything would collapse the "something
+# is wrong" signal into the normal success hue.
+CUSTOM_CSS = """
+.log-panel textarea {
+    font-family: var(--font-mono, 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, monospace) !important;
+    font-size: 0.82em !important;
+    line-height: 1.45 !important;
+}
+
+.progress-block {
+    padding: 8px 2px 4px 2px;
+}
+.progress-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-family: var(--font-mono, 'JetBrains Mono', ui-monospace, Menlo, monospace);
+    font-size: 0.9em;
+    margin-bottom: 6px;
+    color: var(--body-text-color, inherit);
+}
+.progress-pct {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+.progress-track {
+    background: var(--block-border-color, rgba(128, 128, 128, 0.22));
+    height: 8px;
+    border-radius: 4px;
+    overflow: hidden;
+}
+.progress-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.35s ease, background 0.25s ease;
+}
+
+/* Small LED indicator for the connection status dot in the sidebar. The
+   actual character is a colored emoji (🟢/🔴/⚪) — this just ensures
+   vertical alignment with the adjacent refresh button. */
+#conn-indicator {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.1em;
+    min-width: 28px;
+}
+
+/* Keep the compact refresh button aligned with the textbox it sits next
+   to. Gradio's row baseline defaults can drift when a textbox has a
+   label and the button doesn't. */
+#test-btn {
+    align-self: flex-end;
+}
+"""
 
 
 # ─── Dark-mode forcing ────────────────────────────────────────────────────
@@ -96,12 +190,11 @@ FORCE_DARK_MODE_JS = """
 }
 """
 
-# JS fired by the Copy button. Reads the raw markdown source from a hidden
-# gr.Textbox rather than the rendered ``final-summary`` markdown's innerText,
-# so the clipboard gets ``# Heading`` / ``**bold**`` / ``| table |`` syntax
-# intact. The ``final-summary-source`` elem_id is mirrored in build_demo.
-# Gradio wraps the Textbox value inside a <textarea>; .value gives the raw
-# content. (M6.5 S1 fix; previously copied innerText which stripped syntax.)
+# JS fired by the Copy button. Reads the raw markdown source from the
+# final_summary_source Textbox's <textarea> rather than the rendered
+# markdown's innerText, so the clipboard gets `# Heading` / `**bold**` /
+# `| table |` syntax intact. See build_demo() for the matching Textbox.
+# (M6.5 S1)
 COPY_SUMMARY_JS = """
 () => {
     const host = document.getElementById('final-summary-source');
@@ -117,6 +210,56 @@ COPY_SUMMARY_JS = """
     navigator.clipboard.writeText(ta.value || '');
 }
 """
+
+
+# ─── Progress-bar HTML helper (M6.5 M1) ──────────────────────────────────
+
+def _progress_html(phase: str, pct: int, state: str = "running") -> str:
+    """Render the progress bar's HTML for injection into a gr.HTML component.
+
+    ``state`` picks the fill color and matches the four UX states:
+      running   → theme accent (Nymbo: green)
+      success   → theme accent (same green; icon + text differentiates)
+      error     → red (hardcoded — no safe theme slot for destructive state)
+      cancelled → amber (hardcoded — no safe theme slot for paused state)
+
+    Inline ``background:`` uses ``var(--color-accent, #11ba88)`` so the bar
+    tracks whatever theme is loaded; the #11ba88 fallback matches Nymbo
+    explicitly for themes that don't populate the var. Modern browsers
+    resolve CSS vars inside inline style attributes, which is what makes
+    this work without a separate CSS class per state.
+
+    ``pct`` is clamped to [0, 100]. Non-int inputs are coerced via int().
+    The phase text is HTML-escaped because exception messages surfaced to
+    the bar could contain `<` / `>`.
+    """
+    colors = {
+        "running":   "var(--color-accent, #11ba88)",
+        "success":   "var(--color-accent, #11ba88)",
+        "error":     "#ef4444",
+        "cancelled": "#f59e0b",
+    }
+    color = colors.get(state, colors["running"])
+    try:
+        pct_int = max(0, min(100, int(pct)))
+    except (TypeError, ValueError):
+        pct_int = 0
+    safe_phase = (
+        phase.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    return (
+        '<div class="progress-block">'
+        '<div class="progress-header">'
+        f'<span class="progress-phase">{safe_phase}</span>'
+        f'<span class="progress-pct">{pct_int}%</span>'
+        '</div>'
+        '<div class="progress-track">'
+        f'<div class="progress-fill" style="width: {pct_int}%; background: {color};"></div>'
+        '</div>'
+        '</div>'
+    )
 
 
 # ─── Ollama helpers (pure I/O; no Gradio imports) ────────────────────────
@@ -260,20 +403,12 @@ def _install_process_hooks() -> None:
 def init_session_state() -> dict[str, Any]:
     """Factory for ``gr.State``. Returns a fresh dict per session.
 
-    Shape::
-
-        {'tempdir_path':        str | None,
-         'canonical_md':        str | None,  # path to step1 output
-         'uploaded_stem':       str | None,  # original filename stem
-         'final_summary_path':  str | None,  # path to the step5 output
-         'models_used':         set[str],    # eject on finally / tab close
-         'ollama_host':         str,
-         'run_in_progress':     bool}
-
-    ``tempdir_path`` uses ``tempfile.mkdtemp()`` (string path) rather than a
-    ``TemporaryDirectory`` object — the object carries a finalizer that
-    doesn't play well with gr.State deepcopy semantics. Cleanup is explicit
-    via ``shutil.rmtree(ignore_errors=True)`` in ``cleanup_session``.
+    See ``contexts/gradio_app.md`` for the full shape. Brief reminder:
+    ``log_text`` / ``progress_pct`` / ``progress_phase`` were added in
+    M6.5 L1+M1 so ``on_stop`` can reconstruct the cancellation view at
+    the exact point the user hit Stop (on_stop only receives state_val,
+    no step-local context — the generator publishes its progress to
+    state on every yield for this reason).
 
     Passed as ``gr.State(init_session_state())`` — the call produces a
     dict which Gradio then deepcopies per session. (Passing the callable
@@ -289,6 +424,9 @@ def init_session_state() -> dict[str, Any]:
         "models_used": set(),
         "ollama_host": DEFAULT_OLLAMA_HOST,
         "run_in_progress": False,
+        "log_text": "",
+        "progress_pct": 0,
+        "progress_phase": "",
     }
 
 
@@ -303,37 +441,12 @@ def cleanup_session(state_val: dict[str, Any] | None = None) -> None:
     """Per-session cleanup. Fired by ``gr.State``'s ``delete_callback``.
 
     Gradio 6 deletes a session's ``gr.State`` ~60 minutes after the user's
-    browser disconnects (configurable via ``delete_cache`` but 60 min is
-    the default). When that deletion happens, ``delete_callback`` is
-    invoked with the state value.
+    browser disconnects. Ejects the session's touched models and removes
+    its tempdir. Best-effort: all exceptions swallowed.
 
-    Ejects the session's touched models and removes its tempdir. Best-
-    effort: all exceptions swallowed so a cleanup error can never crash
-    the server process.
-
-    The ``state_val: ... | None = None`` signature exists for a specific
-    reason: Gradio 6's internal signature-validator for ``delete_callback``
-    treats the callback as an event listener with an empty inputs list,
-    producing a spurious ``UserWarning: Expected 1 arguments ... received
-    0`` at app startup when the function declares one required arg. Making
-    the arg optional silences that warning at check time while the actual
-    invocation at delete time (Gradio's docs are clear that the callback
-    receives the state value) still reaches the full cleanup path. If for
-    some reason Gradio ever does call us with no args, the ``isinstance``
-    guard below makes this a safe no-op and the ``atexit``/SIGTERM hooks
-    still cover shutdown.
-
-    The 60-min delay means idle models may stay loaded on ziggie after a
-    tab closes. Two other cleanup paths cover the real-time cases:
-      * The pipeline generator's ``finally`` block ejects models at
-        end-of-run (success, error, or Stop).
-      * The process-level ``atexit`` + SIGTERM handlers walk
-        ``_ALL_MODELS_EVER_LOADED`` on shutdown.
-
-    Previously attached to ``demo.unload`` — but Gradio 6's unload doesn't
-    inject ``gr.State`` into the callback (it passes zero args). Switched
-    to ``delete_callback`` on ``gr.State`` itself, which is the documented
-    pattern for per-session cleanup that gets the state dict directly.
+    The optional ``state_val`` arg silences a spurious Gradio 6
+    ``check_function_inputs_match`` warning at State creation time. See
+    spec changelog (M6 fix-up) for the full rationale.
     """
     if not isinstance(state_val, dict):
         return
@@ -355,10 +468,29 @@ def _banner_update_for_host(host: str) -> dict:
     return gr.update(
         value=(
             f"⚠ Cannot reach Ollama at `{host}`. "
-            "Update the host in the sidebar and click **Test connection**."
+            "Update the host in the sidebar and click the **🔄** button."
         ),
         visible=True,
     )
+
+
+def _connection_indicator(host: str) -> str:
+    """LED indicator markdown for the sidebar.
+
+    Returns a single emoji:
+      🟢 — reachable
+      🔴 — unreachable
+      ⚪ — empty host (not tested)
+
+    Called from ``on_startup``, ``on_host_change``, ``on_test_connection``.
+    Each returns its own probe; if this ends up showing performance lag on
+    slow networks we can cache per-host for a few seconds, but for now the
+    OLLAMA_PROBE_TIMEOUT caps worst-case latency at 3s.
+    """
+    if not host or not host.strip():
+        return "⚪"
+    ok, _ = test_ollama_connection(host)
+    return "🟢" if ok else "🔴"
 
 
 def _model_indicator(host: str, model: str) -> str:
@@ -378,89 +510,163 @@ def _model_indicator(host: str, model: str) -> str:
     return "✗ not pulled"
 
 
-def on_startup(state_val: dict[str, Any]) -> tuple[dict, str, str]:
-    """``demo.load`` handler. Checks reachability + validates default models."""
+def on_startup(state_val: dict[str, Any]) -> tuple[dict, str, str, str]:
+    """``demo.load`` handler. Checks reachability + validates default models.
+
+    Returns a 4-tuple: (banner, editor_status, extractor_status,
+    connection_indicator). Grew from 3 → 4 at M6.5 when the standalone
+    ``Test connection`` button + status markdown were collapsed into a
+    compact refresh button + LED indicator next to the host Textbox.
+    """
     host = state_val.get("ollama_host", DEFAULT_OLLAMA_HOST)
     banner = _banner_update_for_host(host)
     editor_ind = _model_indicator(host, DEFAULT_EDITOR_MODEL)
     extractor_ind = _model_indicator(host, DEFAULT_EXTRACTOR_MODEL)
-    return banner, editor_ind, extractor_ind
+    conn_ind = _connection_indicator(host)
+    return banner, editor_ind, extractor_ind, conn_ind
 
 
 def on_host_change(
     host: str, editor: str, extractor: str, state_val: dict[str, Any]
-) -> tuple[dict, dict, str, str]:
+) -> tuple[dict, dict, str, str, str]:
     """When host textbox changes: update session state, refresh banner,
-    re-validate both model fields (they depend on host reachability)."""
+    re-validate both model fields, and refresh the LED indicator.
+
+    5-tuple return. On every keystroke in the host textbox we probe the
+    server, which fires three HTTP requests (banner, model indicator ×2,
+    LED indicator all independently call test_ollama_connection /
+    list_available_models). Not ideal for rapid typing but acceptable
+    given OLLAMA_PROBE_TIMEOUT=3s and the rarity of editing the host URL
+    during normal use. If typing lag becomes annoying, debounce with a
+    Gradio Timer or collapse into a single probe.
+    """
     state_val["ollama_host"] = host
     banner = _banner_update_for_host(host)
     editor_ind = _model_indicator(host, editor)
     extractor_ind = _model_indicator(host, extractor)
-    return state_val, banner, editor_ind, extractor_ind
+    conn_ind = _connection_indicator(host)
+    return state_val, banner, editor_ind, extractor_ind, conn_ind
 
 
 def on_test_connection(host: str) -> tuple[str, dict]:
-    """Explicit 'Test connection' button click.
+    """Compact refresh button handler.
 
-    Returns (status-line markdown, banner update). Success hides the banner,
-    failure shows it so the user sees the same message in both places.
+    Returns (connection_indicator, banner). Replaces the old 'Test
+    connection' text button + separate status markdown; now the button
+    just updates the LED and the banner in one click.
     """
-    ok, msg = test_ollama_connection(host)
+    ok, _ = test_ollama_connection(host)
+    conn_ind = "🟢" if ok else "🔴"
     if ok:
-        return msg, gr.update(value="", visible=False)
-    return msg, gr.update(
-        value=(
-            f"⚠ Cannot reach Ollama at `{host}`. "
-            "Update the host in the sidebar and click **Test connection**."
-        ),
-        visible=True,
+        banner = gr.update(value="", visible=False)
+    else:
+        banner = gr.update(
+            value=(
+                f"⚠ Cannot reach Ollama at `{host}`. "
+                "Check the host URL and try again."
+            ),
+            visible=True,
+        )
+    return conn_ind, banner
+
+
+def on_view_mode_change(mode: str) -> tuple[dict, dict]:
+    """Radio toggle between rendered markdown and raw markdown source.
+
+    Returns (final_summary_md update, final_summary_source update). Only
+    toggles visibility — values are preserved across toggles because
+    Gradio doesn't reset component value on visibility change.
+
+    CRITICAL: ``final_summary_source`` must never be flipped to
+    ``visible=False`` or the Copy button's JS loses the <textarea> it
+    reads from. "Rendered" mode uses ``visible="hidden"`` (CSS-hidden but
+    in DOM); "Raw" mode uses ``visible=True``. Both keep the DOM element
+    present. See COPY_SUMMARY_JS + the Textbox declaration in build_demo.
+    """
+    if mode == "Raw":
+        return (
+            gr.update(visible=False),      # final_summary_md hidden
+            gr.update(visible=True),        # final_summary_source visible (still in DOM)
+        )
+    # "Rendered" (default)
+    return (
+        gr.update(visible=True),            # final_summary_md visible
+        gr.update(visible="hidden"),        # final_summary_source hidden but still in DOM
     )
 
 
 def on_stop(state_val: dict[str, Any]) -> tuple:
     """Stop-button click handler.
 
-    Returns an 8-tuple matching the Run button's output layout, with the
-    extra slot being ``final_summary_source`` (hidden textbox used for
-    markdown-source clipboard copy). Re-enables Run, hides Stop, clears
-    the summary + source, writes a cancellation status line.
+    Returns a 12-tuple matching the Run button's output layout:
 
-    The actual cancellation of the in-flight generator is done by Gradio's
-    ``cancels=[run_event]`` wiring on the Stop button's .click. The
-    generator's ``finally`` block ejects models on GeneratorExit.
+        1. console_group visibility      (kept visible so user sees the log)
+        2. progress_html value           (rebuilt with 'cancelled' state + last pct)
+        3. log_panel value               (stored log + appended cancel marker)
+        4. summary_section visibility    (hidden — nothing to show)
+        5. view_mode update              (reset to "Rendered", hidden)
+        6. final_summary_md update       (cleared + hidden)
+        7. final_summary_source update   (value-only; stays visible="hidden")
+        8. copy_btn visibility           (hidden)
+        9. download_btn update           (cleared + hidden)
+       10. run_btn interactive           (re-enabled)
+       11. session_state                 (updated log_text)
+       12. stop_btn visibility           (hidden)
 
-    Note: due to the non-streaming Ollama calls (spec F3), clicking Stop
-    while a step is mid-call will not interrupt the HTTP request. The
-    generator cancels when the current step returns, which can be 1–3
-    minutes on big models. The UI returns to idle immediately; the backend
-    finishes catching up behind the scenes.
+    Grew from 10 → 12 at M6.5 second pass (added summary_section and
+    view_mode for the rendered/raw toggle + panel-wrapper visibility).
+
+    Non-streaming Ollama (spec F3): clicking Stop while a step is mid-call
+    does not interrupt the HTTP request. The generator cancels when the
+    current step returns (1–3 min on big models). The UI returns to idle
+    immediately; the backend finishes catching up in the background. The
+    appended log line tells the user to expect this delay.
     """
+    log_text = state_val.get("log_text", "")
+    if log_text and not log_text.endswith("\n"):
+        log_text += "\n"
+    log_text += (
+        "\n⏸ Cancel requested. Current step will finish before models "
+        "unload (non-streaming Ollama trade-off; usually 1–3 min).\n"
+    )
+    state_val["log_text"] = log_text
+
+    pct = state_val.get("progress_pct", 0)
+    phase = state_val.get("progress_phase", "")
+    header = f"⏸ Cancelled during {phase}" if phase else "⏸ Cancelled by user"
+
     return (
-        gr.update(value="⏸ Cancelled by user.", visible=True),   # run_status
-        gr.update(value="", visible=False),                      # final_summary_md
-        gr.update(value=""),                                     # final_summary_source (stays "hidden")
-        gr.update(visible=False),                                # copy_btn
-        gr.update(value=None, visible=False),                    # download_btn
-        gr.update(interactive=True),                             # run_btn
-        state_val,                                               # session_state
-        gr.update(visible=False),                                # stop_btn
+        gr.update(visible=True),                                   # console_group
+        gr.update(value=_progress_html(header, pct, "cancelled")),# progress_html
+        gr.update(value=log_text),                                 # log_panel
+        gr.update(visible=False),                                  # summary_section
+        gr.update(value="Rendered", visible=False),                # view_mode (reset + hide)
+        gr.update(value="", visible=False),                        # final_summary_md
+        gr.update(value=""),                                       # final_summary_source (stays "hidden")
+        gr.update(visible=False),                                  # copy_btn
+        gr.update(value=None, visible=False),                      # download_btn
+        gr.update(interactive=True),                               # run_btn
+        state_val,                                                 # session_state
+        gr.update(visible=False),                                  # stop_btn
     )
 
 
-# Empty updates for the five run-output components, used by on_file_upload
+# Empty updates for the nine run-output components. Used by on_file_upload
 # to clear stale results when a new file is uploaded or the upload is cleared.
-# (Grew from 4 to 5 entries at M6.5 when final_summary_source was added.)
 #
-# NOTE for final_summary_source: we pass value-only updates (no `visible=`)
-# everywhere because the component lives in the DOM permanently as
-# visible="hidden". Flipping it to False would yank the <textarea> out of
-# the DOM and break the Copy button's JS lookup.
+# Grew 5 → 7 (M6.5 L1+M1+M2) → 9 (M6.5 panel + toggle pass) as the run
+# output surface area grew. Order MUST match the event-listener outputs
+# list in build_demo.
 _RUN_OUTPUT_RESET = (
-    gr.update(value="", visible=False),   # run_status
-    gr.update(value="", visible=False),   # final_summary_md
-    gr.update(value=""),                  # final_summary_source (stays "hidden")
-    gr.update(visible=False),             # copy_btn
-    gr.update(value=None, visible=False), # download_btn
+    gr.update(visible=False),                # console_group
+    gr.update(value=""),                     # progress_html
+    gr.update(value=""),                     # log_panel
+    gr.update(visible=False),                # summary_section (whole panel hidden)
+    gr.update(value="Rendered", visible=False),  # view_mode (reset + hide)
+    gr.update(value="", visible=False),      # final_summary_md
+    gr.update(value=""),                     # final_summary_source (stays "hidden")
+    gr.update(visible=False),                # copy_btn
+    gr.update(value=None, visible=False),    # download_btn
 )
 
 
@@ -470,22 +676,13 @@ def on_file_upload(
 ) -> tuple:
     """Handle file upload / clear.
 
-    Runs step1_convert into the session tempdir, renders preview, detects
-    generic speakers, enables Run if ingest succeeded.
+    Returns a 16-tuple in this order:
+        preview_md, error_md, run_btn, detected_speakers_state,
+        speaker_map_state, session_state, meta_md,
+        + 9 entries from _RUN_OUTPUT_RESET (console panel, summary panel,
+          view_mode, summary + copy + download — all cleared/hidden).
 
-    Returns a 12-tuple in this order to match the event listener's outputs:
-        preview_md update,
-        error_md update,
-        run_btn update,
-        detected_speakers_state,
-        speaker_map_state (always reset to {} on new upload),
-        session_state,
-        meta_md update,
-        run_status update,          (reset — stale after new upload)
-        final_summary_md update,    (reset)
-        final_summary_source update,(reset — S1)
-        copy_btn update,            (reset)
-        download_btn update         (reset)
+    Grew from 12 → 14 (M6.5 L1+M1+M2) → 16 (panel + toggle pass).
 
     Any exception from step1 — including ``SystemExit`` raised on format-
     detection failures — is caught explicitly. A bare ``except Exception``
@@ -497,6 +694,9 @@ def on_file_upload(
         state_val["canonical_md"] = None
         state_val["uploaded_stem"] = None
         state_val["final_summary_path"] = None
+        state_val["log_text"] = ""
+        state_val["progress_pct"] = 0
+        state_val["progress_phase"] = ""
         return (
             gr.update(value="", visible=False),   # preview
             gr.update(value="", visible=False),   # error
@@ -520,13 +720,14 @@ def on_file_upload(
         shutil.copy(src, dst)
         _, md_path = convert(dst, raw_dir)
     except BaseException as e:
-        # SystemExit is raised by step1 on unrecognized format / empty parse;
-        # catch it here so Gradio's worker keeps running.
         err_type = type(e).__name__
         err_msg = str(e) or err_type
         state_val["canonical_md"] = None
         state_val["uploaded_stem"] = None
         state_val["final_summary_path"] = None
+        state_val["log_text"] = ""
+        state_val["progress_pct"] = 0
+        state_val["progress_phase"] = ""
         return (
             gr.update(value="", visible=False),
             gr.update(
@@ -545,11 +746,11 @@ def on_file_upload(
     state_val["canonical_md"] = str(md_path)
     state_val["uploaded_stem"] = src.stem
     state_val["final_summary_path"] = None  # prior runs' output is now stale
+    state_val["log_text"] = ""
+    state_val["progress_pct"] = 0
+    state_val["progress_phase"] = ""
 
     speakers = detect_generic_speakers(canonical_md)
-    # Line count excluding headings/blanks gives a rough turn count for the
-    # meta display; exact turn count lives in the .json sidecar emitted by
-    # step1, but this is cheaper than re-reading it.
     n_turns = sum(
         1 for line in canonical_md.splitlines() if line.startswith("**")
     )
@@ -584,60 +785,90 @@ def run_pipeline_generator(
 ) -> Iterator[tuple]:
     """Run steps 2 → 5 on the session's ingested transcript.
 
-    Generator: yields an 8-tuple at each phase boundary matching the Run
-    button's outputs list (run_status, final_summary_md, final_summary_source,
-    copy_btn, download_btn, run_btn, session_state, stop_btn).
+    Generator: yields a 12-tuple at each phase boundary matching the Run
+    button's outputs list:
 
-    The ``final_summary_source`` slot is a hidden gr.Textbox that mirrors
-    the raw markdown source; Copy button JS reads its textarea value so
-    the clipboard gets markdown syntax, not stripped innerText (S1 fix).
+        1. console_group       — visibility
+        2. progress_html       — custom bar HTML (phase + % + state color)
+        3. log_panel           — accumulated stdout from the step modules
+        4. summary_section     — visibility of the whole summary panel
+        5. view_mode           — radio reset on success, hidden otherwise
+        6. final_summary_md    — rendered summary (visible on success)
+        7. final_summary_source — raw source (value always set; visibility
+                                   via view_mode toggle — see on_view_mode_change)
+        8. copy_btn
+        9. download_btn
+       10. run_btn
+       11. session_state
+       12. stop_btn
 
-    On pre-flight failure, yields once with an error and stops — no
-    try/finally entered, so no models are touched.
+    Step-to-model mapping (M6.5 polish pass):
+      Step 2 (clean_transcript)   → editor_model
+      Step 3 (apply_speaker_mapping) → pure, no model
+      Step 4 (extract_information) → extractor_model
+      Step 5 (format_summary)      → extractor_model  (was editor_model in M5)
 
-    Inside the try/finally, every yield flips stop_btn visibility to True
-    so it's available throughout the run; the terminal (success, error,
-    and cancellation) paths flip it back to False.
+    The step-5 reassignment matches the new sidebar labels where the
+    extractor model is the one doing "information extraction + final
+    formatting." If both textboxes point at the same model (default), this
+    is a no-op; if users set different models, step 5 now uses the extractor.
 
-    On any step raising (``SystemExit`` from the step modules' ``sys.exit(1)``
-    paths, or any ``Exception``), yields an error and cleans up models in
-    ``finally``. ``GeneratorExit`` (from Stop button's ``cancels=``) also
-    reaches ``finally``, ejecting models. ``KeyboardInterrupt`` propagates
-    so server-side Ctrl-C still works.
+    Stdout capture (L1):
+    Each Ollama-touching step is wrapped in
+    ``contextlib.redirect_stdout(io.StringIO())`` inside try/finally so
+    partial output is still captured on exception. Ollama calls are
+    non-streaming (F3), so prints from a step appear in the log panel as
+    a burst when that step returns. Accepted trade-off — true streaming
+    would require threads + a queue.
 
-    Non-streaming Ollama calls mean cancellation during a step is blocked
-    until the step returns — accepted trade-off per spec F3 / Risks.
+    Known limitation: ``redirect_stdout`` patches ``sys.stdout`` globally.
+    Concurrent runs in the same process would interleave captures.
+    Single-user usage is unaffected; revisit at M7+ if multi-user becomes
+    a real scenario.
 
-    Intermediate files in the session tempdir use a stable stem
-    (``STABLE_STEM = "transcript"``) so downstream ``stem.replace(...)``
-    logic in step modules behaves predictably regardless of the upload's
-    original filename (M6.5 S3 fix).
+    Progress bar granularity: step-grain only — 0 / 25 / 50 / 75 / 100 %.
+    No mid-step smoothing since Ollama response time is opaque.
+
+    Pre-flight failures yield once and return WITHOUT entering the
+    try/finally — so no models are touched. The error message is surfaced
+    in the log panel itself (consistent with run-time log panel UX).
+
+    ``GeneratorExit`` (from Stop's ``cancels=``) reaches ``finally``,
+    ejecting models. The cancellation view is rendered by ``on_stop``
+    which reads ``progress_pct`` + ``log_text`` from state.
     """
-    # ── Pre-flight ────────────────────────────────────────────────────────
+
+    # ── Pre-flight: no transcript ────────────────────────────────────────
     if not state_val.get("canonical_md"):
         yield (
-            gr.update(
-                value="❌ No transcript ingested. Upload a file first.",
-                visible=True,
-            ),
-            gr.update(visible=False),              # final_summary_md
-            gr.update(value=""),                   # final_summary_source (stays "hidden")
-            gr.update(visible=False),              # copy_btn
-            gr.update(visible=False),              # download_btn
-            gr.update(interactive=True),           # run_btn
+            gr.update(visible=True),                                     # console_group
+            gr.update(value=_progress_html("Cannot run", 0, "error")),  # progress_html
+            gr.update(value="❌ No transcript ingested. Upload a file first."),  # log_panel
+            gr.update(visible=False),                                    # summary_section
+            gr.update(value="Rendered", visible=False),                  # view_mode
+            gr.update(value="", visible=False),                          # final_summary_md
+            gr.update(value=""),                                         # final_summary_source
+            gr.update(visible=False),                                    # copy_btn
+            gr.update(value=None, visible=False),                        # download_btn
+            gr.update(interactive=True),                                 # run_btn
             state_val,
-            gr.update(visible=False),              # stop_btn: nothing to cancel
+            gr.update(visible=False),                                    # stop_btn
         )
         return
 
+    # ── Pre-flight: bad models / unreachable host ────────────────────────
     ok, msg = preflight_check(ollama_host, editor_model, extractor_model)
     if not ok:
         yield (
-            gr.update(value=f"❌ Pre-flight failed: {msg}", visible=True),
+            gr.update(visible=True),
+            gr.update(value=_progress_html("Pre-flight failed", 0, "error")),
+            gr.update(value=f"❌ {msg}"),
             gr.update(visible=False),
-            gr.update(value=""),                   # final_summary_source (stays "hidden")
+            gr.update(value="Rendered", visible=False),
+            gr.update(value="", visible=False),
+            gr.update(value=""),
             gr.update(visible=False),
-            gr.update(visible=False),
+            gr.update(value=None, visible=False),
             gr.update(interactive=True),
             state_val,
             gr.update(visible=False),
@@ -647,54 +878,65 @@ def run_pipeline_generator(
     tempdir = Path(state_val["tempdir_path"])
     canonical_md_path = Path(state_val["canonical_md"])
 
-    # Track both models eagerly so the finally block can eject them even if
-    # a step raises before touching Ollama. ``unload_model`` is best-effort,
-    # so extra calls on non-loaded models are harmless.
     state_val["models_used"].update({editor_model, extractor_model})
-    # Module-level tracking for SIGTERM / atexit cleanup.
     _ALL_MODELS_EVER_LOADED.add((ollama_host, editor_model))
     _ALL_MODELS_EVER_LOADED.add((ollama_host, extractor_model))
     state_val["run_in_progress"] = True
 
-    # Stable yields for "no change on this output" — keeps the 8-tuple shape
-    # consistent without re-clobbering fields we don't want to touch.
-    NOOP_FINAL = gr.update()
-    NOOP_SOURCE = gr.update()
-    NOOP_COPY = gr.update()
-    NOOP_DOWNLOAD = gr.update()
+    state_val["log_text"] = ""
+    state_val["progress_pct"] = 0
+    state_val["progress_phase"] = ""
 
     try:
-        # Run button disabled during the run; Stop button revealed.
-        progress(0.0, desc="Cleaning transcript…")
+        # ── Step 1/4: clean_transcript (editor_model) ────────────────────
+        state_val["progress_pct"] = 0
+        state_val["progress_phase"] = "Step 1/4 · Cleaning transcript"
         yield (
-            gr.update(value="**Step 1/4** · Cleaning transcript…", visible=True),
-            NOOP_FINAL, NOOP_SOURCE, NOOP_COPY, NOOP_DOWNLOAD,
-            gr.update(interactive=False),
+            gr.update(visible=True),
+            gr.update(value=_progress_html(state_val["progress_phase"] + "…", 0, "running")),
+            gr.update(value=""),                   # log empty before step 2 runs
+            gr.update(visible=False),              # summary_section hidden
+            gr.update(value="Rendered", visible=False),  # view_mode hidden
+            gr.update(value="", visible=False),    # final_summary_md hidden
+            gr.update(value=""),                   # final_summary_source cleared (stays "hidden")
+            gr.update(visible=False),              # copy_btn hidden
+            gr.update(value=None, visible=False),  # download_btn hidden
+            gr.update(interactive=False),          # run_btn disabled during run
             state_val,
-            gr.update(visible=True),  # stop_btn visible throughout the run
+            gr.update(visible=True),               # stop_btn visible during run
         )
-        cleaned_path = clean_transcript(
-            canonical_md_path,
-            tempdir / "cleaned",
-            editor_model,
-            ollama_host,
-        )
+
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                cleaned_path = clean_transcript(
+                    canonical_md_path,
+                    tempdir / "cleaned",
+                    editor_model,
+                    ollama_host,
+                )
+        finally:
+            state_val["log_text"] += buf.getvalue()
+
         # S3 fix: rename step 2's output to a stable stem before chaining.
-        # step 2 writes `{input.stem}_cleaned.md`; if `input.stem` happens
-        # to contain `_cleaned` or `_named` (e.g. user's `yt_video_en.named`
-        # test file), the downstream stem-replace logic in step 4/5
-        # misbehaves. Renaming to `transcript_cleaned.md` here means
-        # step 3 → 4 → 5 all operate on predictable stems.
         stable_cleaned_path = cleaned_path.parent / f"{STABLE_STEM}_cleaned.md"
         if cleaned_path != stable_cleaned_path:
             cleaned_path.rename(stable_cleaned_path)
             cleaned_path = stable_cleaned_path
 
-        # Step 3: pure, in-memory speaker mapping. No Ollama call.
-        progress(0.25, desc="Applying speaker names…")
+        # ── Step 2/4: apply_speaker_mapping (pure, no model) ─────────────
+        state_val["progress_pct"] = 25
+        state_val["progress_phase"] = "Step 2/4 · Applying speaker names"
         yield (
-            gr.update(value="**Step 2/4** · Applying speaker names…", visible=True),
-            NOOP_FINAL, NOOP_SOURCE, NOOP_COPY, NOOP_DOWNLOAD,
+            gr.update(visible=True),
+            gr.update(value=_progress_html(state_val["progress_phase"] + "…", 25, "running")),
+            gr.update(value=state_val["log_text"]),
+            gr.update(visible=False),
+            gr.update(value="Rendered", visible=False),
+            gr.update(value="", visible=False),
+            gr.update(value=""),
+            gr.update(visible=False),
+            gr.update(value=None, visible=False),
             gr.update(interactive=False),
             state_val,
             gr.update(visible=True),
@@ -703,47 +945,74 @@ def run_pipeline_generator(
         named_text = apply_speaker_mapping(cleaned_text, speaker_map or {})
         named_dir = tempdir / "named"
         named_dir.mkdir(parents=True, exist_ok=True)
-        # Use STABLE_STEM directly (not a replace on cleaned_path.stem) —
-        # the S3 rename above guarantees cleaned_path.stem is exactly
-        # `transcript_cleaned`, but hardcoding is clearer and makes the
-        # intent explicit to the next reader.
         named_path = named_dir / f"{STABLE_STEM}_named.md"
         named_path.write_text(named_text, encoding="utf-8")
 
-        progress(0.50, desc="Extracting information…")
+        # ── Step 3/4: extract_information (extractor_model) ──────────────
+        state_val["progress_pct"] = 50
+        state_val["progress_phase"] = "Step 3/4 · Extracting information"
         yield (
-            gr.update(value="**Step 3/4** · Extracting information…", visible=True),
-            NOOP_FINAL, NOOP_SOURCE, NOOP_COPY, NOOP_DOWNLOAD,
+            gr.update(visible=True),
+            gr.update(value=_progress_html(state_val["progress_phase"] + "…", 50, "running")),
+            gr.update(value=state_val["log_text"]),
+            gr.update(visible=False),
+            gr.update(value="Rendered", visible=False),
+            gr.update(value="", visible=False),
+            gr.update(value=""),
+            gr.update(visible=False),
+            gr.update(value=None, visible=False),
             gr.update(interactive=False),
             state_val,
             gr.update(visible=True),
         )
-        extracted_path = extract_information(
-            named_path,
-            tempdir / "extracted",
-            extractor_model,
-            ollama_host,
-        )
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                extracted_path = extract_information(
+                    named_path,
+                    tempdir / "extracted",
+                    extractor_model,
+                    ollama_host,
+                )
+        finally:
+            state_val["log_text"] += buf.getvalue()
 
-        progress(0.75, desc="Formatting summary…")
+        # ── Step 4/4: format_summary (extractor_model — M6.5 polish) ─────
+        # Previously used editor_model. Re-assignment matches the updated
+        # sidebar labels where the extractor handles both extraction AND
+        # final formatting. Effect for the default config (editor ==
+        # extractor) is zero; for users with distinct models, step 5 now
+        # stays on the extractor rather than re-loading the editor.
+        state_val["progress_pct"] = 75
+        state_val["progress_phase"] = "Step 4/4 · Formatting summary"
         yield (
-            gr.update(value="**Step 4/4** · Formatting final summary…", visible=True),
-            NOOP_FINAL, NOOP_SOURCE, NOOP_COPY, NOOP_DOWNLOAD,
+            gr.update(visible=True),
+            gr.update(value=_progress_html(state_val["progress_phase"] + "…", 75, "running")),
+            gr.update(value=state_val["log_text"]),
+            gr.update(visible=False),
+            gr.update(value="Rendered", visible=False),
+            gr.update(value="", visible=False),
+            gr.update(value=""),
+            gr.update(visible=False),
+            gr.update(value=None, visible=False),
             gr.update(interactive=False),
             state_val,
             gr.update(visible=True),
         )
-        final_path = format_summary(
-            extracted_path,
-            tempdir / "final",
-            editor_model,
-            ollama_host,
-        )
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                final_path = format_summary(
+                    extracted_path,
+                    tempdir / "final",
+                    extractor_model,          # CHANGED from editor_model
+                    ollama_host,
+                )
+        finally:
+            state_val["log_text"] += buf.getvalue()
 
         # Rename the summary file to something user-friendly for download,
-        # based on the original upload's stem. The internal file in /final
-        # lives alongside; we copy rather than rename so any intermediate
-        # debugging artifacts stay intact.
+        # based on the original upload's stem.
         stem = state_val.get("uploaded_stem") or final_path.stem
         download_dir = tempdir / "download"
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -753,43 +1022,52 @@ def run_pipeline_generator(
 
         final_content = download_path.read_text(encoding="utf-8")
 
-        progress(1.0, desc="Done")
+        # ── Terminal success ─────────────────────────────────────────────
+        # Summary section becomes visible. view_mode radio shows + resets
+        # to "Rendered". final_summary_md filled + visible. 
+        # final_summary_source filled (value only — visibility stays
+        # "hidden" until the user toggles the radio to "Raw"). Copy +
+        # Download revealed.
+        state_val["progress_pct"] = 100
+        state_val["progress_phase"] = "Done"
         yield (
-            gr.update(value="✅ Summary ready.", visible=True),
-            gr.update(value=final_content, visible=True),   # rendered markdown
-            gr.update(value=final_content),                  # raw source for Copy
-            gr.update(visible=True),
-            gr.update(value=str(download_path), visible=True),
-            gr.update(interactive=True),
+            gr.update(visible=True),                             # console_group
+            gr.update(value=_progress_html("✅ Done", 100, "success")),
+            gr.update(value=state_val["log_text"]),
+            gr.update(visible=True),                             # summary_section shown
+            gr.update(value="Rendered", visible=True),           # view_mode shown + reset
+            gr.update(value=final_content, visible=True),       # final_summary_md
+            gr.update(value=final_content),                      # final_summary_source (stays "hidden")
+            gr.update(visible=True),                             # copy_btn
+            gr.update(value=str(download_path), visible=True),   # download_btn
+            gr.update(interactive=True),                         # run_btn re-enabled
             state_val,
-            gr.update(visible=False),  # stop_btn hidden on success
+            gr.update(visible=False),                            # stop_btn hidden
         )
 
     except (Exception, SystemExit) as e:
-        # Excludes KeyboardInterrupt and GeneratorExit — GeneratorExit is
-        # how gr.cancels reaches us; we let it propagate so Gradio handles
-        # the cancellation bookkeeping, and the finally block still runs.
         err_type = type(e).__name__
         err_msg = str(e) or err_type
+        state_val["log_text"] += f"\n❌ {err_type}: {err_msg}\n"
+        pct = state_val.get("progress_pct", 0)
+        phase = state_val.get("progress_phase", "Pipeline")
+        header = f"❌ Failed at {phase}" if phase else "❌ Failed"
         yield (
-            gr.update(
-                value=f"❌ Pipeline failed at runtime: {err_type}: {err_msg}",
-                visible=True,
-            ),
+            gr.update(visible=True),
+            gr.update(value=_progress_html(header, pct, "error")),
+            gr.update(value=state_val["log_text"]),
+            gr.update(visible=False),                            # summary_section hidden on error
+            gr.update(value="Rendered", visible=False),
+            gr.update(value="", visible=False),
+            gr.update(value=""),
             gr.update(visible=False),
-            gr.update(value=""),                   # final_summary_source (stays "hidden")
-            gr.update(visible=False),
-            gr.update(visible=False),
+            gr.update(value=None, visible=False),
             gr.update(interactive=True),
             state_val,
-            gr.update(visible=False),  # stop_btn hidden on error
+            gr.update(visible=False),
         )
 
     finally:
-        # Eject models regardless of outcome. Important on success too —
-        # without this, ``keep_alive=-1`` from inside the step functions
-        # leaves both models hot on ziggie until another run or timeout.
-        # Also fires on Stop (GeneratorExit) and Exception paths.
         state_val["run_in_progress"] = False
         for m in list(state_val.get("models_used", ())):
             unload_model(ollama_host, m)
@@ -799,68 +1077,85 @@ def run_pipeline_generator(
 
 def build_demo() -> gr.Blocks:
     """Build the Gradio Blocks app."""
+    # NOTE: ``css=CUSTOM_CSS`` is NOT passed here. In Gradio 6.0 the ``css``
+    # kwarg was moved from the Blocks constructor to ``demo.launch()``.
+    # Passing it here emits a UserWarning and is ignored.
     with gr.Blocks(title="Local Meeting Summarizer") as demo:
-        # Per-session state. ``init_session_state()`` is called here to
-        # produce the initial dict; Gradio deepcopies it per session so each
-        # browser tab gets its own independent copy. Do NOT pass the bare
-        # callable — see ``init_session_state`` docstring for why.
-        #
-        # ``delete_callback`` is invoked with the state dict when Gradio
-        # GCs the session (~60 min after tab close). See ``cleanup_session``
-        # for why this API was chosen over ``demo.unload``.
         session_state = gr.State(
             value=init_session_state(),
             delete_callback=cleanup_session,
         )
-
-        # Drives the @gr.render-decorated speaker form. List of 'Speaker N'
-        # tags detected in the latest upload; empty list = no form shown.
         detected_speakers_state = gr.State([])
-
-        # Written by each speaker-name textbox on change. Read by the Run
-        # handler and passed to apply_speaker_mapping().
         speaker_map_state = gr.State({})
 
+        # ── Sidebar ──────────────────────────────────────────────────────
         with gr.Sidebar():
             gr.Markdown("### Settings")
 
-            ollama_host = gr.Textbox(
-                label="Ollama host",
-                value=DEFAULT_OLLAMA_HOST,
-                placeholder="http://<host>:<port>",
-                info="Where your Ollama server is reachable.",
-            )
+            # Ollama host row: textbox + compact 🔄 button + LED indicator.
+            # Inspired by OpenWebUI's connection edit modal (user screenshot).
+            # Label is rendered separately above the row so the button and
+            # indicator align with the textbox baseline rather than its
+            # label. The textbox has show_label=False but keeps its
+            # placeholder. Replaces the old "Test connection" button + a
+            # separate status markdown that used to sit below the models.
+            gr.Markdown("**Ollama host**")
+            with gr.Row():
+                ollama_host = gr.Textbox(
+                    value=DEFAULT_OLLAMA_HOST,
+                    placeholder="http://<host>:<port>",
+                    show_label=False,
+                    container=False,
+                    scale=5,
+                )
+                test_btn = gr.Button(
+                    "🔄",
+                    scale=0,
+                    min_width=40,
+                    variant="secondary",
+                    elem_id="test-btn",
+                )
+                connection_indicator = gr.Markdown(
+                    "⚪",
+                    elem_id="conn-indicator",
+                )
 
+            # Step-to-model labels corrected (M6.5 polish):
+            #   Editor = step 2 (cleanup only)
+            #   Extractor = steps 4 + 5 (extraction + final formatting)
+            # run_pipeline_generator's step-5 call now also uses
+            # extractor_model to match.
             editor_model = gr.Textbox(
-                label="Editor model (steps 2 & 5)",
+                label="Editor model (step 2)",
                 value=DEFAULT_EDITOR_MODEL,
-                info="Used for cleanup + final formatting.",
+                info="Used for cleanup.",
             )
             editor_status = gr.Markdown("", elem_id="editor-status")
 
             extractor_model = gr.Textbox(
-                label="Extractor model (step 4)",
+                label="Extractor model (steps 4 & 5)",
                 value=DEFAULT_EXTRACTOR_MODEL,
-                info="Used for information extraction.",
+                info="Used for information extraction + final formatting.",
             )
             extractor_status = gr.Markdown("", elem_id="extractor-status")
 
-            test_btn = gr.Button("Test connection", variant="secondary")
-            test_status = gr.Markdown("", elem_id="test-status")
-
+        # ── Main column ──────────────────────────────────────────────────
         with gr.Column():
             # Startup banner: shown only when Ollama is unreachable.
             banner = gr.Markdown("", visible=False, elem_id="ollama-banner")
 
             gr.Markdown("# Local Meeting Summarizer")
             gr.Markdown(
-                "Upload an exported meeting transcript (`.rtf`) from [moonshine-notetaker](https://note-taker.moonshine.ai/) or from the zz's local "
-                "transcriber (`.md`). Files above 10 MB are rejected; ~2.5h of speech "
-                "is the practical ceiling (LLM context window)."
+                "Upload an exported meeting transcript (`.rtf`) from "
+                "[moonshine-notetaker](https://note-taker.moonshine.ai/) or "
+                "from the zz's local transcriber (`.md`). Files above 10 MB "
+                "are rejected; ~2.5h of speech is the practical ceiling "
+                "(LLM context window)."
             )
 
-            # S2: multi-tab note moved from the old footer sub to a
-            # collapsed accordion near the top — visible but unobtrusive.
+            # S2: multi-tab note in "Good to know" accordion. Spec default
+            # is open=False; user prefers open=True and that preference is
+            # preserved here.
             with gr.Accordion("Good to know", open=True):
                 gr.Markdown(
                     "Each tab runs independently — multiple tabs = multiple "
@@ -878,28 +1173,29 @@ def build_demo() -> gr.Blocks:
             )
 
             # Inline error message (e.g. "Could not detect transcript format").
-            # Hidden until ingest fails.
             error_md = gr.Markdown("", visible=False, elem_id="ingest-error")
 
             # One-line status under the upload — turn count + speaker summary.
             meta_md = gr.Markdown("", visible=False, elem_id="ingest-meta")
 
-            # Canonical markdown preview. Scrollable. (No built-in copy
-            # button on gr.Markdown in this Gradio version; users can still
-            # select-and-copy. The final summary has a dedicated Copy button.)
+            # ── Transcript preview (M6.5 panel wrapper) ──────────────────
+            # container=True + padding=True gives the Markdown the theme's
+            # panel border + internal padding, matching what the user
+            # asked for ("border stroke only if the theme component
+            # provides"). height=max_height=PREVIEW_HEIGHT gives internal
+            # scrolling past that height.
             preview_md = gr.Markdown(
                 "",
                 label="Preview",
-                max_height=400,
+                height=PREVIEW_HEIGHT,
+                max_height=PREVIEW_HEIGHT,
                 visible=False,
+                container=True,
+                padding=True,
                 elem_id="transcript-preview",
             )
 
             # ── Dynamic speaker form ─────────────────────────────────────
-            # @gr.render rebuilds its children each time its inputs change.
-            # When detected_speakers_state is an empty list, the function
-            # returns early and nothing renders — that's the "no form" case
-            # from spec scenario #3 (fully pre-named transcripts).
             @gr.render(inputs=[detected_speakers_state])
             def render_speaker_form(speakers: list[str]):
                 if not speakers:
@@ -915,8 +1211,6 @@ def build_demo() -> gr.Blocks:
                         placeholder="Leave blank to keep original label",
                     )
 
-                    # Closure captures the tag; without this, every textbox
-                    # would write to the same key (late-binding gotcha).
                     def _make_updater(captured_tag: str):
                         def _update(new_val: str, current_map: dict[str, str]):
                             new_map = dict(current_map or {})
@@ -933,8 +1227,7 @@ def build_demo() -> gr.Blocks:
                         outputs=[speaker_map_state],
                     )
 
-            # Run + Stop share a row. Stop sits next to Run (hidden until
-            # a run is active). M6.5 layout round may reshuffle this.
+            # Run + Stop share a row.
             with gr.Row():
                 run_btn = gr.Button(
                     "Run",
@@ -949,74 +1242,108 @@ def build_demo() -> gr.Blocks:
                     elem_id="stop-btn",
                 )
 
-            # ── Run-time output section ─────────────────────────────────
-            # All hidden until the pipeline makes progress. Status ticks
-            # through the 4 phases; on success the rendered summary, Copy,
-            # and Download reveal together.
-            run_status = gr.Markdown("", visible=False, elem_id="run-status")
-
-            final_summary_md = gr.Markdown(
-                "",
-                label="Meeting summary",
-                visible=False,
-                elem_id="final-summary",
-            )
-
-            # Hidden Textbox that mirrors the markdown source. COPY_SUMMARY_JS
-            # reads this element's <textarea>.value at click time (NOT
-            # final_summary_md's innerText, which strips markdown syntax
-            # from rendered output). M6.5 S1 fix.
-            #
-            # visible="hidden" (STRING literal, not False) is load-bearing:
-            # per gradio/components/textbox.py docstring, "If False, component
-            # will be hidden. If 'hidden', component will be visually hidden
-            # and not take up space in the layout BUT STILL EXIST IN THE DOM."
-            # Our first M6.5 pass used visible=False and the clipboard never
-            # updated (JS `querySelector('textarea')` returned null), so the
-            # OS clipboard kept whatever was there before the click. Do not
-            # flip this to False or to True anywhere in the session — value
-            # updates only. interactive=True ensures Gradio renders a real
-            # <textarea> element (interactive=False can render a read-only
-            # display element in some builds).
-            final_summary_source = gr.Textbox(
-                value="",
-                visible="hidden",
-                elem_id="final-summary-source",
-                interactive=True,
-                show_label=False,
-            )
-
-            with gr.Row():
-                copy_btn = gr.Button(
-                    "Copy summary",
-                    variant="secondary",
-                    visible=False,
-                    elem_id="copy-btn",
+            # ── Console panel: progress bar + log (M6.5 L1+M1+M2) ────────
+            with gr.Group(visible=False) as console_group:
+                progress_html = gr.HTML(value="", elem_id="progress-html")
+                log_panel = gr.Textbox(
+                    value="",
+                    label="",
+                    show_label=False,
+                    lines=LOG_PANEL_LINES,
+                    max_lines=LOG_PANEL_LINES,
+                    autoscroll=True,
+                    interactive=False,
+                    elem_id="log-panel",
+                    elem_classes=["log-panel"],
+                    placeholder="",
                 )
-                download_btn = gr.DownloadButton(
-                    "Download .md",
-                    visible=False,
-                    elem_id="download-btn",
+
+            # ── Results section (separate panel further down) ────────────
+            # Wrapped in gr.Column(variant="panel") for the theme-provided
+            # border stroke. visible=False on the column hides the entire
+            # section (including its border) pre-run and on error/cancel,
+            # so we don't show an empty bordered box waiting for content.
+            with gr.Column(variant="panel", visible=False) as summary_section:
+                # Radio toggle between rendered markdown and raw source.
+                # show_label=False + container=False keep it tight
+                # horizontally. horizontal orientation comes from Gradio's
+                # default for 2-option radios. Value drives
+                # on_view_mode_change which flips visibility of the two
+                # summary components below.
+                view_mode = gr.Radio(
+                    choices=["Rendered", "Raw"],
+                    value="Rendered",
+                    show_label=False,
+                    container=False,
+                    interactive=True,
+                    elem_id="view-mode",
                 )
+
+                # Rendered markdown. container=True + padding=True +
+                # height=max_height=SUMMARY_HEIGHT gives the theme's
+                # bordered panel with internal scrolling past the fixed
+                # height (user asks #3).
+                final_summary_md = gr.Markdown(
+                    "",
+                    label="Meeting summary",
+                    height=SUMMARY_HEIGHT,
+                    max_height=SUMMARY_HEIGHT,
+                    container=True,
+                    padding=True,
+                    visible=False,
+                    elem_id="final-summary",
+                )
+
+                # Raw markdown source — same component that powers the
+                # Copy button via COPY_SUMMARY_JS. DOM-persistent via
+                # visible="hidden" so the <textarea> is always available
+                # for the JS lookup even when the user has "Rendered"
+                # selected. Switching the radio to "Raw" flips it to
+                # visible=True (still in DOM). MUST NEVER go to
+                # visible=False — that would remove the element and break
+                # Copy. See COPY_SUMMARY_JS comment.
+                #
+                # lines=max_lines=SUMMARY_RAW_LINES keeps the Raw box
+                # roughly the same vertical size as the Rendered box so
+                # the radio toggle doesn't jump the layout.
+                final_summary_source = gr.Textbox(
+                    value="",
+                    visible="hidden",
+                    elem_id="final-summary-source",
+                    interactive=True,
+                    show_label=False,
+                    lines=SUMMARY_RAW_LINES,
+                    max_lines=SUMMARY_RAW_LINES,
+                )
+
+                with gr.Row():
+                    copy_btn = gr.Button(
+                        "Copy",
+                        variant="secondary",
+                        visible=False,
+                        elem_id="copy-btn",
+                    )
+                    download_btn = gr.DownloadButton(
+                        "Download",
+                        visible=False,
+                        elem_id="download-btn",
+                    )
 
         # ── Event wiring ──────────────────────────────────────────────────
 
-        # Page load: check reachability + validate default models + force dark.
         demo.load(
             on_startup,
             inputs=[session_state],
-            outputs=[banner, editor_status, extractor_status],
+            outputs=[banner, editor_status, extractor_status, connection_indicator],
         )
         demo.load(fn=None, inputs=None, outputs=None, js=FORCE_DARK_MODE_JS)
 
-        # Host change: update session state, refresh banner, re-validate models.
         ollama_host.change(
             on_host_change,
             inputs=[ollama_host, editor_model, extractor_model, session_state],
-            outputs=[session_state, banner, editor_status, extractor_status],
+            outputs=[session_state, banner, editor_status, extractor_status, connection_indicator],
         )
 
-        # Model textbox changes: validate only that one.
         editor_model.change(
             _model_indicator,
             inputs=[ollama_host, editor_model],
@@ -1028,15 +1355,23 @@ def build_demo() -> gr.Blocks:
             outputs=[extractor_status],
         )
 
-        # Explicit Test connection button — mirrors banner state.
+        # Compact refresh button in the host row — replaces the old
+        # standalone "Test connection" button + separate status line.
         test_btn.click(
             on_test_connection,
             inputs=[ollama_host],
-            outputs=[test_status, banner],
+            outputs=[connection_indicator, banner],
         )
 
-        # File upload: ingest, render preview, detect speakers, enable Run.
-        # Also clears any stale run-result components from a previous run.
+        # Radio toggle — rendered vs raw. Only toggles visibility; values
+        # are set by the run_pipeline_generator's success yield and
+        # preserved across visibility changes.
+        view_mode.change(
+            on_view_mode_change,
+            inputs=[view_mode],
+            outputs=[final_summary_md, final_summary_source],
+        )
+
         upload.change(
             on_file_upload,
             inputs=[upload, session_state],
@@ -1048,7 +1383,11 @@ def build_demo() -> gr.Blocks:
                 speaker_map_state,
                 session_state,
                 meta_md,
-                run_status,
+                console_group,
+                progress_html,
+                log_panel,
+                summary_section,
+                view_mode,
                 final_summary_md,
                 final_summary_source,
                 copy_btn,
@@ -1056,8 +1395,6 @@ def build_demo() -> gr.Blocks:
             ],
         )
 
-        # Run button → streams through steps 2–5. Captured into a variable
-        # so the Stop button can ``cancels=[run_event]`` it.
         run_event = run_btn.click(
             run_pipeline_generator,
             inputs=[
@@ -1068,7 +1405,11 @@ def build_demo() -> gr.Blocks:
                 speaker_map_state,
             ],
             outputs=[
-                run_status,
+                console_group,
+                progress_html,
+                log_panel,
+                summary_section,
+                view_mode,
                 final_summary_md,
                 final_summary_source,
                 copy_btn,
@@ -1079,15 +1420,15 @@ def build_demo() -> gr.Blocks:
             ],
         )
 
-        # Stop button: cancels the in-flight generator AND resets the UI.
-        # Due to non-streaming Ollama (spec F3), the actual model unload
-        # waits for the current step to return; UI returns to idle
-        # immediately so the user isn't confused.
         stop_btn.click(
             on_stop,
             inputs=[session_state],
             outputs=[
-                run_status,
+                console_group,
+                progress_html,
+                log_panel,
+                summary_section,
+                view_mode,
                 final_summary_md,
                 final_summary_source,
                 copy_btn,
@@ -1099,9 +1440,6 @@ def build_demo() -> gr.Blocks:
             cancels=[run_event],
         )
 
-        # Copy button is pure JS — reads the raw markdown source from the
-        # hidden final_summary_source Textbox's textarea and writes to the
-        # clipboard. No Python round-trip, no innerText stripping. (S1)
         copy_btn.click(
             None,
             inputs=None,
@@ -1115,10 +1453,6 @@ def build_demo() -> gr.Blocks:
 # ─── Entry point ──────────────────────────────────────────────────────────
 
 def main() -> None:
-    # load_dotenv() already ran at module import, so DEFAULT_OLLAMA_HOST
-    # reflects .env by now. Refuse to launch if it's still unset — matches
-    # main.py's stance that running without an explicit host config is
-    # user error, not something to paper over with a localhost default.
     if not DEFAULT_OLLAMA_HOST:
         print(
             "Error: OLLAMA_HOST is missing. Please define it in a .env file.",
@@ -1126,8 +1460,6 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Install atexit + SIGTERM before the server starts accepting requests.
-    # Main-thread only; both handlers walk `_ALL_MODELS_EVER_LOADED`.
     _install_process_hooks()
 
     demo = build_demo()
@@ -1136,6 +1468,7 @@ def main() -> None:
         server_port=SERVER_PORT,
         inbrowser=True,
         theme=gr.Theme.from_hub("Nymbo/Nymbo_Theme"),
+        css=CUSTOM_CSS,  # Gradio 6 moved `css` from Blocks() to launch()
         max_file_size=UPLOAD_MAX_SIZE,
     )
 
