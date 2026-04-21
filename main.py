@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Master Orchestrator for the Meeting Summarization Pipeline.
-Processes an RTF transcript through cleanup, mapping, extraction, and formatting.
+Processes a meeting transcript (.rtf from Moonshine or .md from our transcriber)
+through cleanup, mapping, extraction, and formatting.
 """
 
 import os
@@ -34,7 +35,11 @@ def main():
     )
 
     # Required Input
-    parser.add_argument("input_rtf", type=Path, help="Path to the raw .rtf transcript")
+    parser.add_argument(
+        "input_file",
+        type=Path,
+        help="Path to the transcript (.rtf from Moonshine, or .md from our transcriber)",
+    )
 
     # Global/Path Options
     parser.add_argument(
@@ -65,11 +70,16 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.input_rtf.exists():
-        print(f"Error: Input file not found: {args.input_rtf}")
+    if not args.input_file.exists():
+        print(f"Error: Input file not found: {args.input_file}")
         sys.exit(1)
 
-    print(f"\n Starting Pipeline for: {args.input_rtf.name}")
+    suffix = args.input_file.suffix.lower()
+    if suffix not in {".rtf", ".md"}:
+        print(f"Error: Unsupported input format '{suffix}'. Expected .rtf or .md.")
+        sys.exit(1)
+
+    print(f"\n Starting Pipeline for: {args.input_file.name}")
     print("-" * 40)
 
     # --- Setup Directories ---
@@ -81,9 +91,9 @@ def main():
 
     # --- Execute Pipeline ---
     try:
-        # Step 1: Parse RTF
-        print("\n[1/5] Parsing RTF to Markdown...")
-        _, md_path = convert(args.input_rtf, dir_raw)
+        # Step 1: Ingest & normalize (RTF or MD)
+        print("\n[1/5] Ingesting transcript to Markdown...")
+        _, md_path = convert(args.input_file, dir_raw)
 
         # Step 2: Cleanup (Uses Editor Model)
         print(f"\n[2/5] Cleaning transcript using {args.editor_model}...")
