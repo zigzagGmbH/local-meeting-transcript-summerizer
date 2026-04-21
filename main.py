@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from ollama import Client
 
 # Import the core functions from our pipeline modules
+from pipeline import announce
 from pipeline.step1_convert import convert
 from pipeline.step2_cleanup import clean_transcript
 from pipeline.step3_mapping import map_speakers
@@ -92,29 +93,31 @@ def main():
     # --- Execute Pipeline ---
     try:
         # Step 1: Ingest & normalize (RTF or MD)
-        print("\n[1/5] Ingesting transcript to Markdown...")
+        announce(1, 5, "Ingesting transcript to Markdown")
         _, md_path = convert(args.input_file, dir_raw)
 
         # Step 2: Cleanup (Uses Editor Model)
-        print(f"\n[2/5] Cleaning transcript using {args.editor_model}...")
+        announce(2, 5, "Cleaning transcript", args.editor_model)
         cleaned_path = clean_transcript(
             md_path, dir_cleaned, args.editor_model, args.host
         )
 
         # Step 3: Human-in-the-Loop Mapping
-        print("\n[3/5] Human-in-the-loop Speaker Mapping...")
+        announce(3, 5, "Human-in-the-loop Speaker Mapping")
         named_path = map_speakers(cleaned_path, dir_named)
 
         # Step 4: Extraction (Uses Extractor Model)
-        print(f"\n[4/5] Extracting intelligence using {args.extractor_model}...")
+        announce(4, 5, "Extracting intelligence", args.extractor_model)
         extracted_path = extract_information(
             named_path, dir_extracted, args.extractor_model, args.host
         )
 
-        # Step 5: Formatting (Uses Editor Model)
-        print(f"\n[5/5] Formatting final summary using {args.editor_model}...")
+        # Step 5: Formatting (Uses Extractor Model — aligned with app.py's
+        # M6.5 round 2 change; the extractor model produces the final
+        # structured summary, not the editor model.)
+        announce(5, 5, "Formatting final summary", args.extractor_model)
         final_path = format_summary(
-            extracted_path, dir_final, args.editor_model, args.host
+            extracted_path, dir_final, args.extractor_model, args.host
         )
 
         print("-" * 40)

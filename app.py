@@ -42,6 +42,7 @@ import gradio as gr
 import httpx
 from dotenv import load_dotenv
 
+from pipeline import announce
 from pipeline.step1_convert import convert
 from pipeline.step2_cleanup import clean_transcript
 from pipeline.step3_mapping import apply_speaker_mapping
@@ -165,29 +166,29 @@ CUSTOM_CSS = """
     border: 1px solid var(--border-color-primary, rgba(255, 255, 255, 0.08)) !important;
 }
 #progress-label meter {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 100%;
-    height: 10px;
-    border: none;
-    border-radius: 5px;
-    background: rgba(255, 255, 255, 0.08);
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    width: 100% !important;
+    height: 10px !important;
+    border: none !important;
+    border-radius: 5px !important;
+    background: rgba(255, 255, 255, 0.08) !important;
 }
 #progress-label meter::-webkit-meter-bar {
-    background: rgba(255, 255, 255, 0.08);
-    border: none;
-    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.08) !important;
+    border: none !important;
+    border-radius: 5px !important;
 }
 #progress-label meter::-webkit-meter-optimum-value,
 #progress-label meter::-webkit-meter-suboptimum-value,
 #progress-label meter::-webkit-meter-even-less-good-value {
-    background: #11ba88;
-    border-radius: 5px;
+    background: #11ba88 !important;
+    border-radius: 5px !important;
     transition: width 0.25s ease;
 }
 #progress-label meter::-moz-meter-bar {
-    background: #11ba88;
-    border-radius: 5px;
+    background: #11ba88 !important;
+    border-radius: 5px !important;
 }
 
 /* Rendered/Raw toggle — display controlled by a class on the outer column
@@ -846,10 +847,12 @@ def run_pipeline_generator(
     state_val["progress_phase"] = ""
 
     try:
-        # ── Step 1/4: clean_transcript (editor_model, streamed) ──────────
+        # ── Step 1/4 in the UI's counting (step 2 in the pipeline):
+        #    clean_transcript (editor_model, streamed) ────────────────────
         state_val["progress_pct"] = 0
         state_val["progress_phase"] = "Step 1/4 · Cleaning transcript"
         yield _running_tuple()
+        announce(1, 4, "Cleaning transcript", editor_model)
 
         for _ in _stream_step(
             state_val,
@@ -874,6 +877,7 @@ def run_pipeline_generator(
         state_val["progress_pct"] = 25
         state_val["progress_phase"] = "Step 2/4 · Applying speaker names"
         yield _running_tuple()
+        announce(2, 4, "Applying speaker names")
 
         cleaned_text = cleaned_path.read_text(encoding="utf-8")
         named_text = apply_speaker_mapping(cleaned_text, speaker_map or {})
@@ -886,6 +890,7 @@ def run_pipeline_generator(
         state_val["progress_pct"] = 50
         state_val["progress_phase"] = "Step 3/4 · Extracting information"
         yield _running_tuple()
+        announce(3, 4, "Extracting intelligence", extractor_model)
 
         for _ in _stream_step(
             state_val,
@@ -904,6 +909,7 @@ def run_pipeline_generator(
         state_val["progress_pct"] = 75
         state_val["progress_phase"] = "Step 4/4 · Formatting summary"
         yield _running_tuple()
+        announce(4, 4, "Formatting final summary", extractor_model)
 
         for _ in _stream_step(
             state_val,
