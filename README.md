@@ -266,7 +266,7 @@ uv run step2_cleanup.py input.md --host http://<your_ollama_host_ADDR>:<your_oll
 - [x] g-radio with simpler API and MCP (local testing)
 - [x] Test MCP with remote file upload
 - [ ] Test with tool calling features from openwebui
-- [ ] deploy in docker
+- [ ] deploy in docker (and test again all tool calling stuff)
 ---
 
 <sub>Saurabh Datta · [zigzag.is](https://zigzag.is) · Berlin · April 2026</sub>
