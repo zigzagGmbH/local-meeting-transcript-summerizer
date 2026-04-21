@@ -262,7 +262,8 @@ uv run step2_cleanup.py input.md --host http://<your_ollama_host_ADDR>:<your_oll
   - [x] Auto-detect `.rtf` vs `.md` at step 1; skip RTF conversion when input is already markdown.
   - [x] Transcriber's H3-heading diarization pattern normalized into the same canonical `**Speaker N:**` shape as Moonshine.
   - [x] Speaker IDs and real names both parsed; if the transcriber has already renamed speakers, step 3's human-in-the-loop pass becomes a no-op automatically.
-- [ ] g-radio implementation (for mcp and api support out of box)
+- [x] g-radio implementation (as it has PAI and MCP support out of box)
+- [ ] g-radio with simpler API and MCP
 - [ ] deploy in docker
 - [ ] test with tool calling features  
 ---

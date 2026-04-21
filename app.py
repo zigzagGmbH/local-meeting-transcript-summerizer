@@ -268,6 +268,7 @@ COPY_SUMMARY_JS = """
 
 # ─── Threaded log streaming ──────────────────────────────────────────────
 
+
 class _Tee:
     """Write-only stream that fans out to multiple underlying streams.
 
@@ -378,6 +379,7 @@ def _stream_step(
 
 # ─── Progress-bar helper ─────────────────────────────────────────────────
 
+
 def _progress_value(phase: str, pct: int) -> dict[str, float]:
     """Shape the value dict gr.Label expects: {label: fraction}.
 
@@ -394,6 +396,7 @@ def _progress_value(phase: str, pct: int) -> dict[str, float]:
 
 
 # ─── Ollama helpers ───────────────────────────────────────────────────────
+
 
 def test_ollama_connection(host: str) -> tuple[bool, str]:
     if not host or not host.strip():
@@ -461,6 +464,7 @@ def preflight_check(
 
 # ─── Process-level shutdown handlers ─────────────────────────────────────
 
+
 def _global_cleanup_loaded_models() -> None:
     for host, model in list(_ALL_MODELS_EVER_LOADED):
         unload_model(host, model)
@@ -485,6 +489,7 @@ def _install_process_hooks() -> None:
 
 
 # ─── Session state factory ───────────────────────────────────────────────
+
 
 def init_session_state() -> dict[str, Any]:
     """Factory for ``gr.State``. See contexts/gradio_app.md for full shape."""
@@ -521,6 +526,7 @@ def cleanup_session(state_val: dict[str, Any] | None = None) -> None:
 
 
 # ─── UI event handlers ───────────────────────────────────────────────────
+
 
 def _banner_update_for_host(host: str) -> dict:
     ok, _ = test_ollama_connection(host)
@@ -622,15 +628,15 @@ def on_stop(state_val: dict[str, Any]) -> tuple:
     header = f"⏸ Cancelled during {phase}" if phase else "⏸ Cancelled by user"
 
     return (
-        gr.update(visible=True),                          # console_group
-        gr.update(value=_progress_value(header, pct)),    # progress_label
-        gr.update(value=log_text),                        # log_panel
-        gr.update(visible=False),                         # summary_section
-        gr.update(visible=False),                         # copy_btn
-        gr.update(value=None, visible=False),             # download_btn
-        gr.update(interactive=True),                      # run_btn
-        state_val,                                        # session_state
-        gr.update(visible=False),                         # stop_btn
+        gr.update(visible=True),  # console_group
+        gr.update(value=_progress_value(header, pct)),  # progress_label
+        gr.update(value=log_text),  # log_panel
+        gr.update(visible=False),  # summary_section
+        gr.update(visible=False),  # copy_btn
+        gr.update(value=None, visible=False),  # download_btn
+        gr.update(interactive=True),  # run_btn
+        state_val,  # session_state
+        gr.update(visible=False),  # stop_btn
     )
 
 
@@ -638,12 +644,12 @@ def on_stop(state_val: dict[str, Any]) -> tuple:
 # main top-level outputs. Used by on_file_upload to clear state on new
 # upload / upload clear. Order MUST match build_demo's outputs list.
 _RUN_OUTPUT_RESET = (
-    gr.update(visible=False),                           # console_group
-    gr.update(value={}),                                # progress_label
-    gr.update(value=""),                                # log_panel
-    gr.update(visible=False),                           # summary_section
-    gr.update(visible=False),                           # copy_btn
-    gr.update(value=None, visible=False),               # download_btn
+    gr.update(visible=False),  # console_group
+    gr.update(value={}),  # progress_label
+    gr.update(value=""),  # log_panel
+    gr.update(visible=False),  # summary_section
+    gr.update(visible=False),  # copy_btn
+    gr.update(value=None, visible=False),  # download_btn
 )
 
 
@@ -669,10 +675,10 @@ def on_file_upload(
             gr.update(value="", visible=False),
             gr.update(value="", visible=False),
             gr.update(interactive=False),
-            [],                                       # all_speakers_state
-            {},                                       # speaker_map_state
+            [],  # all_speakers_state
+            {},  # speaker_map_state
             state_val,
-            gr.update(value="", visible=False),       # meta_md
+            gr.update(value="", visible=False),  # meta_md
             *_RUN_OUTPUT_RESET,
         )
 
@@ -719,9 +725,7 @@ def on_file_upload(
     all_speakers = detect_all_speakers(canonical_md)
     generic_count = sum(1 for _, is_gen in all_speakers if is_gen)
 
-    n_turns = sum(
-        1 for line in canonical_md.splitlines() if line.startswith("**")
-    )
+    n_turns = sum(1 for line in canonical_md.splitlines() if line.startswith("**"))
     meta_bits = [f"{n_turns} turns ingested"]
     if generic_count:
         meta_bits.append(f"{generic_count} generic speaker(s) to name")
@@ -744,6 +748,7 @@ def on_file_upload(
 
 
 # ─── Pipeline orchestration ──────────────────────────────────────────────
+
 
 def run_pipeline_generator(
     state_val: dict[str, Any],
@@ -780,22 +785,25 @@ def run_pipeline_generator(
     main thread returns to idle immediately, the step thread's blocking
     HTTP call finishes in the background before models actually unload.
     """
+
     def _running_tuple(stop_visible: bool = True) -> tuple:
         return (
-            gr.update(visible=True),                                         # console_group
-            gr.update(value=_progress_value(
-                state_val["progress_phase"] + "…", state_val["progress_pct"]
-            )),                                                              # progress_label
-            gr.update(value=state_val["log_text"]),                          # log_panel
-            gr.update(visible=False),                                        # summary_section
-            gr.update(value="Rendered"),                                     # view_mode
-            gr.update(value=""),                                             # final_summary_md
-            gr.update(value=""),                                             # final_summary_source
-            gr.update(visible=False),                                        # copy_btn
-            gr.update(value=None, visible=False),                            # download_btn
-            gr.update(interactive=False),                                    # run_btn
+            gr.update(visible=True),  # console_group
+            gr.update(
+                value=_progress_value(
+                    state_val["progress_phase"] + "…", state_val["progress_pct"]
+                )
+            ),  # progress_label
+            gr.update(value=state_val["log_text"]),  # log_panel
+            gr.update(visible=False),  # summary_section
+            gr.update(value="Rendered"),  # view_mode
+            gr.update(value=""),  # final_summary_md
+            gr.update(value=""),  # final_summary_source
+            gr.update(visible=False),  # copy_btn
+            gr.update(value=None, visible=False),  # download_btn
+            gr.update(interactive=False),  # run_btn
             state_val,
-            gr.update(visible=stop_visible),                                 # stop_btn
+            gr.update(visible=stop_visible),  # stop_btn
         )
 
     # ── Pre-flight: no transcript ────────────────────────────────────────
@@ -943,18 +951,18 @@ def run_pipeline_generator(
         state_val["progress_pct"] = 100
         state_val["progress_phase"] = "Done"
         yield (
-            gr.update(visible=True),                                        # console_group
-            gr.update(value=_progress_value("✅ Done", 100)),               # progress_label
-            gr.update(value=state_val["log_text"]),                         # log_panel
-            gr.update(visible=True),                                        # summary_section
-            gr.update(value="Rendered"),                                    # view_mode
-            gr.update(value=final_content),                                 # final_summary_md
-            gr.update(value=final_content),                                 # final_summary_source
-            gr.update(visible=True),                                        # copy_btn
-            gr.update(value=str(download_path), visible=True),              # download_btn
-            gr.update(interactive=True),                                    # run_btn
+            gr.update(visible=True),  # console_group
+            gr.update(value=_progress_value("✅ Done", 100)),  # progress_label
+            gr.update(value=state_val["log_text"]),  # log_panel
+            gr.update(visible=True),  # summary_section
+            gr.update(value="Rendered"),  # view_mode
+            gr.update(value=final_content),  # final_summary_md
+            gr.update(value=final_content),  # final_summary_source
+            gr.update(visible=True),  # copy_btn
+            gr.update(value=str(download_path), visible=True),  # download_btn
+            gr.update(interactive=True),  # run_btn
             state_val,
-            gr.update(visible=False),                                       # stop_btn
+            gr.update(visible=False),  # stop_btn
         )
 
     except (Exception, SystemExit) as e:
@@ -985,7 +993,167 @@ def run_pipeline_generator(
             unload_model(ollama_host, m)
 
 
+# ─── MCP-exposed tool ──────────────────────────────────────────────────
+
+def summarize_transcript(
+    file: str,
+    editor_model: str = DEFAULT_EDITOR_MODEL,
+    extractor_model: str = DEFAULT_EXTRACTOR_MODEL,
+    ollama_host: str | None = None,
+    speaker_map: dict[str, str] | None = None,
+    progress: gr.Progress = gr.Progress(),
+) -> str:
+    """Summarize a meeting transcript into polished meeting minutes.
+
+    This is the MCP-exposed endpoint. Called by LLM tool-calling clients
+    (Claude Desktop, Open WebUI, Cursor, etc.) via the Gradio MCP server
+    at ``/gradio_api/mcp/``. The UI uses a separate generator pathway
+    (``run_pipeline_generator``) that yields progress updates into
+    Gradio components; this function is the headless equivalent that
+    runs the full pipeline to completion and returns the final summary
+    as a string.
+
+    **Important for agent callers:** action-item attribution quality
+    depends on the transcript having real speaker names pre-assigned.
+    When called without ``speaker_map``, any generic "Speaker N" tags
+    are left as-is, which can lead to mis-attributed action items. For
+    best results, either pre-name speakers in the transcript source,
+    or pass ``speaker_map={"Speaker 1": "Alice", "Speaker 2": "Bob"}``.
+
+    Args:
+        file: Path or URL to a .rtf (Moonshine export) or .md (local
+            transcriber output) transcript. Gradio's MCP transport
+            accepts public URLs and base64-encoded uploads and
+            materialises them to a local path before calling.
+        editor_model: Ollama model tag for the cleanup step (step 2).
+            Defaults to ``gemma4:26b``.
+        extractor_model: Ollama model tag for the extraction (step 4)
+            and final-formatting (step 5) steps. Defaults to
+            ``gemma4:26b``.
+        ollama_host: Override for the server's ``OLLAMA_HOST`` env
+            var. Omit to use the server default.
+        speaker_map: Optional mapping of generic "Speaker N" tags to
+            real names. Ignored if empty or None.
+        progress: Injected by Gradio. MCP clients should not pass this.
+
+    Returns:
+        The final meeting summary as a markdown string, including a
+        Participants list, Executive Summary, Key Discussion Points,
+        and Action Items table.
+
+    Raises:
+        ValueError: if ``ollama_host`` is missing and no env default
+            is configured, if the file cannot be located or ingested
+            (unknown format, unreadable), or if Ollama is unreachable
+            / either model is not pulled on the host. All loaded
+            models are unloaded before the exception propagates.
+        RuntimeError: if a pipeline step (cleanup, extraction,
+            formatting) fails. All loaded models are unloaded before
+            the exception propagates.
+    """
+    # Resolve host. Explicit arg > env > fail.
+    host = (ollama_host or DEFAULT_OLLAMA_HOST or "").strip()
+    if not host:
+        raise ValueError(
+            "ollama_host not provided and OLLAMA_HOST env var not set"
+        )
+
+    # Pre-flight: reachability + both models pulled. Matches the UI's
+    # Run-click gate so the two entry points fail for the same reasons.
+    ok, msg = preflight_check(host, editor_model, extractor_model)
+    if not ok:
+        raise ValueError(msg)
+
+    input_path = Path(file)
+    if not input_path.exists():
+        raise ValueError(f"Input file not found: {file}")
+
+    # Fresh tempdir per call — no session state to hang onto.
+    tempdir = Path(tempfile.mkdtemp(prefix="meeting_summarizer_mcp_"))
+    models_used = {editor_model, extractor_model}
+    # Track so SIGTERM / atexit can unload even if this call is
+    # interrupted mid-flight (matches UI behaviour).
+    for m in models_used:
+        _ALL_MODELS_EVER_LOADED.add((host, m))
+
+    try:
+        # ── Step 1/5: ingest ──────────────────────────────────────────────────
+        progress(0.0, desc="Ingesting transcript")
+        announce(1, 5, "Ingesting transcript to Markdown")
+        raw_dir = tempdir / "raw_files"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            _, canonical_md = convert(input_path, raw_dir)
+        except SystemExit as e:
+            # step1 signals format rejection via sys.exit — translate
+            # to a proper exception type for MCP clients.
+            raise ValueError(
+                f"Could not ingest {input_path.name}: "
+                f"step 1 rejected the file ({e})"
+            ) from e
+
+        # ── Step 2/5: cleanup ─────────────────────────────────────────────────
+        progress(0.15, desc="Cleaning transcript")
+        announce(2, 5, "Cleaning transcript", editor_model)
+        cleaned_path = clean_transcript(
+            canonical_md, tempdir / "cleaned", editor_model, host
+        )
+        # Stable stem keeps downstream filenames predictable when the
+        # source stem contains ".named" (S3 fix; applies equally here).
+        stable_cleaned = cleaned_path.parent / f"{STABLE_STEM}_cleaned.md"
+        if cleaned_path != stable_cleaned:
+            cleaned_path.rename(stable_cleaned)
+            cleaned_path = stable_cleaned
+
+        # ── Step 3/5: speaker mapping (pure, no model) ──────────────────────
+        progress(0.35, desc="Applying speaker names")
+        announce(3, 5, "Applying speaker names")
+        cleaned_text = cleaned_path.read_text(encoding="utf-8")
+        named_text = apply_speaker_mapping(cleaned_text, speaker_map or {})
+        named_dir = tempdir / "named"
+        named_dir.mkdir(parents=True, exist_ok=True)
+        named_path = named_dir / f"{STABLE_STEM}_named.md"
+        named_path.write_text(named_text, encoding="utf-8")
+
+        # ── Step 4/5: extraction ────────────────────────────────────────────────
+        progress(0.50, desc="Extracting intelligence")
+        announce(4, 5, "Extracting intelligence", extractor_model)
+        extracted_path = extract_information(
+            named_path, tempdir / "extracted", extractor_model, host
+        )
+
+        # ── Step 5/5: format ───────────────────────────────────────────────────
+        progress(0.75, desc="Formatting final summary")
+        announce(5, 5, "Formatting final summary", extractor_model)
+        final_path = format_summary(
+            extracted_path, tempdir / "final", extractor_model, host
+        )
+
+        progress(1.0, desc="Done")
+        return final_path.read_text(encoding="utf-8")
+
+    except ValueError:
+        # Pre-flight / bad-file errors already carry the right type —
+        # pass through.
+        raise
+    except (Exception, SystemExit) as e:
+        # Everything else (step failures, Ollama mid-call errors) gets
+        # wrapped as RuntimeError so MCP clients get a uniform
+        # "pipeline blew up" signal.
+        raise RuntimeError(
+            f"Pipeline step failed: {type(e).__name__}: {e}"
+        ) from e
+    finally:
+        # Eject models on every exit path — success, raise, or cancel.
+        # unload_model swallows transport errors so this never masks
+        # the real exception.
+        for m in models_used:
+            unload_model(host, m)
+        shutil.rmtree(tempdir, ignore_errors=True)
+
+
 # ─── UI construction ──────────────────────────────────────────────────────
+
 
 def build_demo() -> gr.Blocks:
     with gr.Blocks(title="Meeting Transcription Summarizer (Local)") as demo:
@@ -1084,6 +1252,7 @@ def build_demo() -> gr.Blocks:
                     )
 
                 with gr.Column():
+
                     @gr.render(inputs=[all_speakers_state])
                     def render_speaker_form(
                         all_speakers: list[tuple[str, bool]],
@@ -1110,6 +1279,7 @@ def build_demo() -> gr.Blocks:
                                         else:
                                             new_map.pop(captured_tag, None)
                                         return new_map
+
                                     return _update
 
                                 tb.change(
@@ -1224,7 +1394,13 @@ def build_demo() -> gr.Blocks:
         ollama_host.change(
             on_host_change,
             inputs=[ollama_host, editor_model, extractor_model, session_state],
-            outputs=[session_state, banner, editor_status, extractor_status, connection_indicator],
+            outputs=[
+                session_state,
+                banner,
+                editor_status,
+                extractor_status,
+                connection_indicator,
+            ],
         )
 
         editor_model.change(
@@ -1344,6 +1520,7 @@ def build_demo() -> gr.Blocks:
 
 # ─── Entry point ──────────────────────────────────────────────────────────
 
+
 def main() -> None:
     if not DEFAULT_OLLAMA_HOST:
         print(
@@ -1362,6 +1539,7 @@ def main() -> None:
         theme=gr.Theme.from_hub("Nymbo/Nymbo_Theme"),
         css=CUSTOM_CSS,
         max_file_size=UPLOAD_MAX_SIZE,
+        mcp_server=True,
     )
 
 
