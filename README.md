@@ -264,7 +264,7 @@ uv run step2_cleanup.py input.md --host http://<your_ollama_host_ADDR>:<your_oll
   - [x] Speaker IDs and real names both parsed; if the transcriber has already renamed speakers, step 3's human-in-the-loop pass becomes a no-op automatically.
 - [x] g-radio implementation (as it has PAI and MCP support out of box)
 - [x] g-radio with simpler API and MCP (local testing)
-- [ ] Test MCP with remote file upload
+- [x] Test MCP with remote file upload
 - [ ] Test with tool calling features from openwebui
 - [ ] deploy in docker
 ---
