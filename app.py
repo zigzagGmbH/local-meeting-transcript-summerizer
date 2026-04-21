@@ -1574,7 +1574,10 @@ def main() -> None:
     demo.launch(
         server_name=SERVER_HOST,
         server_port=SERVER_PORT,
-        inbrowser=True,
+        # Do not auto-open a browser tab. Matters for headless hosts
+        # like ziggie where there IS no desktop, and is just noisy on
+        # Mac dev. Users hit http://<host>:7860 manually.
+        inbrowser=False,
         theme=gr.Theme.from_hub("Nymbo/Nymbo_Theme"),
         css=CUSTOM_CSS,
         max_file_size=UPLOAD_MAX_SIZE,
