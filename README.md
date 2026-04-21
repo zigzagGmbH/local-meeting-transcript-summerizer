@@ -169,6 +169,7 @@ It will automatically build the output directories, process the transcript, paus
 # Run the full pipeline with default models
 uv run main.py transcripts/MeetingTranscript.rtf
 
+
 # Run the full pipeline using the Mix-and-Match model strategy
 uv run main.py transcripts/MeetingTranscript.rtf \
     --editor-model gemma4:26b \
@@ -250,7 +251,9 @@ uv run step2_cleanup.py input.md --host http://<your_ollama_host_ADDR>:<your_oll
   - [ ] Can it take a .md at first, skipping first step of conversion (by auto detecting .rtf or other formats vs .md)?
   - [ ] How can we account for our transcriber’s diarization pattern (export would be .md - requiring cleanup) and moonshine’s pattern of .rtf, with diff diarization pattern. 
   - [ ] Can it parse based on speaker ID as well as name, so the human in the loop step won't be necessary as our transcriber can already do speaker renaming and mapping 
-
+- [ ] g-radio implementation (for mcp and api support out of box)
+- [ ] deploy in docker
+- [ ] test with tool calling features  
 ---
 
 <sub>Saurabh Datta · [zigzag.is](https://zigzag.is) · Berlin · April 2026</sub>
