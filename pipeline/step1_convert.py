@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 """
-Convert a moonshine.ai RTF transcript into JSON + Markdown.
+Step 1: Ingest + Normalize a meeting transcript.
+
+Dispatches by file suffix:
+  - .rtf  ->  Moonshine.ai transcript (via striprtf)
+  - .md   ->  Our local transcriber's export (M2, not yet implemented)
+
+Both paths emit the same canonical markdown shape:
+
+    # Transcript: <source_filename>
+
+    **Speaker N:** merged text for this turn...
+
+    **Speaker M:** merged text for this turn...
+
+Plus a JSON sidecar with turn stats.
 
 Usage:
-    uv run step1_convert.py input.rtf [--out-dir .]
+    uv run python -m pipeline.step1_convert input.rtf [--out-dir .]
+    uv run python -m pipeline.step1_convert input.md  [--out-dir .]   # M2+
 
 Dependencies:
     striprtf  (pure-python, no native deps)
@@ -24,6 +39,11 @@ from pathlib import Path
 from striprtf.striprtf import rtf_to_text
 
 SPEAKER_RE = re.compile(r"^\s*(Speaker\s+\d+)\s*:\s*$", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Shared parsing/emission helpers (format-agnostic)
+# ---------------------------------------------------------------------------
 
 
 def parse_turns(plain_text: str) -> list[dict]:
@@ -73,33 +93,88 @@ def build_json(turns: list[dict], source_name: str) -> dict:
     return {
         "source": source_name,
         "n_turns": len(turns),
-        "speakers": sorted(speaker_counts.keys(), 
-                        key=lambda s: int(s.split()[-1])),
+        "speakers": sorted(
+            speaker_counts.keys(),
+            key=lambda s: int(s.split()[-1]) if s.split()[-1].isdigit() else 0,
+        ),
         "turns_per_speaker": dict(speaker_counts),
         "word_count": word_count,
         "turns": turns,
     }
 
 
-def convert(rtf_path: Path, out_dir: Path) -> tuple[Path, Path]:
+def _write_outputs(
+    turns: list[dict], source_name: str, out_dir: Path, stem: str
+) -> tuple[Path, Path]:
+    """Shared writer: emit <stem>.json + <stem>.md into out_dir."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"{stem}.json"
+    md_path = out_dir / f"{stem}.md"
+
+    json_path.write_text(
+        json.dumps(build_json(turns, source_name), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    md_path.write_text(build_markdown(turns, source_name), encoding="utf-8")
+    return json_path, md_path
+
+
+# ---------------------------------------------------------------------------
+# Format-specific ingesters
+# ---------------------------------------------------------------------------
+
+
+def _ingest_moonshine_rtf(rtf_path: Path, out_dir: Path) -> tuple[Path, Path]:
+    """Parse a Moonshine.ai RTF transcript into canonical markdown + JSON."""
     rtf_text = rtf_path.read_text(encoding="utf-8", errors="replace")
     plain = rtf_to_text(rtf_text, errors="ignore")
     turns = parse_turns(plain)
     if not turns:
         raise SystemExit(
-            f"No speaker turns found in {rtf_path}. " "Is this really a moonshine RTF?"
+            f"No speaker turns found in {rtf_path}. Is this really a moonshine RTF?"
         )
+    return _write_outputs(turns, rtf_path.name, out_dir, rtf_path.stem)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = out_dir / f"{rtf_path.stem}.json"
-    md_path = out_dir / f"{rtf_path.stem}.md"
 
-    json_path.write_text(
-        json.dumps(build_json(turns, rtf_path.name), ensure_ascii=False, indent=2),
-        encoding="utf-8",
+def _ingest_markdown(md_path: Path, out_dir: Path) -> tuple[Path, Path]:
+    """Parse our local transcriber's .md export into canonical markdown + JSON.
+
+    Stubbed until M2. See contexts/multi_format_ingest.md.
+    """
+    raise NotImplementedError(
+        f"Markdown ingest not yet implemented (milestone M2). "
+        f"Received: {md_path}. "
+        f"For now, only .rtf inputs are supported."
     )
-    md_path.write_text(build_markdown(turns, rtf_path.name), encoding="utf-8")
-    return json_path, md_path
+
+
+# ---------------------------------------------------------------------------
+# Public entry point (dispatch by suffix)
+# ---------------------------------------------------------------------------
+
+
+def convert(input_path: Path, out_dir: Path) -> tuple[Path, Path]:
+    """Ingest a transcript file and emit canonical markdown + JSON sidecar.
+
+    Dispatches by file suffix:
+      .rtf  ->  Moonshine RTF ingester
+      .md   ->  Local transcriber markdown ingester (M2)
+
+    Returns (json_path, md_path).
+    """
+    suffix = input_path.suffix.lower()
+    if suffix == ".rtf":
+        return _ingest_moonshine_rtf(input_path, out_dir)
+    if suffix == ".md":
+        return _ingest_markdown(input_path, out_dir)
+    raise SystemExit(
+        f"Unsupported input format: '{suffix}'. Expected .rtf or .md."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -107,7 +182,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=doc_lines[1] if len(doc_lines) > 1 else ""
     )
-    ap.add_argument("rtf", type=Path, help="Input .rtf transcript")
+    ap.add_argument(
+        "input_file",
+        type=Path,
+        help="Input transcript (.rtf from Moonshine, or .md from our transcriber)",
+    )
     ap.add_argument(
         "--out-dir",
         type=Path,
@@ -116,7 +195,7 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    json_path, md_path = convert(args.rtf, args.out_dir)
+    json_path, md_path = convert(args.input_file, args.out_dir)
     print(f"wrote {json_path}")
     print(f"wrote {md_path}")
 

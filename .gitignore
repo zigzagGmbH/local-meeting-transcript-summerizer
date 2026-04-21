@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+contexts/*
 
 .DS_Store
 *.log
@@ -36,3 +37,4 @@ output/extracted_files/*
 
 output/final_summaries/*
 !output/final_summaries/README.md
+§
