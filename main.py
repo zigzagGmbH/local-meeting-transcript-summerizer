@@ -64,7 +64,7 @@ def main():
     parser.add_argument(
         "--extractor-model",
         type=str,
-        default="qwen3.5:27b",
+        default="gemma4:26b",
         help="Model used for Information Extraction (Step 4)",
     )
 
