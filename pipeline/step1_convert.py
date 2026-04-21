@@ -215,13 +215,29 @@ def _normalize_speaker_tag(raw: str) -> str:
 
 
 def _looks_like_transcriber(text: str) -> bool:
-    """Cheap sniff: does this file contain H3 speaker headings?"""
-    return bool(re.search(r"^###\s+\S", text, re.MULTILINE))
+    """Cheap sniff: does this file contain transcriber-style H3 speaker headings?
+
+    Requires either an explicit 'SPEAKER_N' prefix or a bracket token (for the
+    timestamp block) on the heading line. Prevents plain documents with H3
+    section titles (e.g. a README) from being misdetected as transcripts.
+    """
+    return bool(
+        re.search(
+            r"^###\s+(?:SPEAKER_\d+|[^\n]*?\[)",
+            text,
+            re.MULTILINE | re.IGNORECASE,
+        )
+    )
 
 
 def _looks_like_canonical(text: str) -> bool:
-    """Cheap sniff: does this file contain inline **Name:** tags?"""
-    return bool(re.search(r"^\*\*[^*\n]+:\*\*", text, re.MULTILINE))
+    """Cheap sniff: does this file contain inline **Name:** speaker tags?
+
+    Requires at least 2 line-start matches so that stray bolded labels in prose
+    (e.g. a README with '**Our Solution:** We break ...') aren't misdetected.
+    """
+    matches = re.findall(r"(?:^|\n)\*\*[^*\n]+?:\*\*\s+\S", text)
+    return len(matches) >= 2
 
 
 def _parse_transcriber_turns(text: str) -> list[dict]:
