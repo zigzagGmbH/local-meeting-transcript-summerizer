@@ -1188,7 +1188,8 @@ def _materialize_input(src: str, dest_dir: Path) -> Path:
 
 
 def summarize_transcript(
-    file: str,
+    file: str | None = None,
+    content: str | None = None,
     editor_model: str = DEFAULT_EDITOR_MODEL,
     extractor_model: str = DEFAULT_EXTRACTOR_MODEL,
     ollama_host: str | None = None,
@@ -1217,8 +1218,9 @@ def summarize_transcript(
     or pass ``speaker_map={"Speaker 1": "Alice", "Speaker 2": "Bob"}``.
 
     Args:
-        file: Transcript source. Accepts three formats so the MCP
-            client doesn't need filesystem access to the server:
+        file: Transcript source by reference. Accepts three formats so
+            the MCP client doesn't need filesystem access to the
+            server:
 
               * ``data:<mime>;base64,<payload>`` — base64-encoded file
                 content inlined in the request. Use ``application/rtf``
@@ -1235,6 +1237,34 @@ def summarize_transcript(
             Resulting filename must end in ``.rtf`` (Moonshine export)
             or ``.md`` (local transcriber output); step 1 rejects
             everything else.
+
+            Mutually exclusive with ``content``. Exactly one must be
+            provided.
+        content: Transcript source by value. The raw string body of
+            the transcript, already text-extracted. Written to a
+            per-call tempfile with a ``.rtf`` extension if the content
+            starts with ``{\rtf`` (for RTF source bodies), otherwise
+            ``.md``. Then handed off to step 1 just like a real file
+            upload would be.
+
+            Primary use case: MCP clients like Open WebUI that extract
+            text from chat-uploaded files into the LLM's context but
+            do NOT expose a URL or path to tools. The calling LLM can
+            paste the extracted text here verbatim (see issue #12228
+            upstream; URL-based uploads are blocked pending that fix).
+
+            Quality caveat: content passed this way has already been
+            through the calling client's text extractor. For Moonshine
+            RTFs extracted by Open WebUI, speaker labels (``**Speaker
+            1:**``) may or may not survive the extractor depending on
+            its configuration. For ``.md`` inputs from our local
+            transcriber, round-tripping through an extractor is
+            lossless. When speaker labels are lost, attribution in the
+            final Action Items table degrades to ``(unnamed)`` — pass
+            ``speaker_map`` if you can infer names from context.
+
+            Mutually exclusive with ``file``. Exactly one must be
+            provided.
         editor_model: Ollama model tag for the cleanup step (step 2).
             Defaults to ``gemma4:26b``.
         extractor_model: Ollama model tag for the extraction (step 4)
@@ -1251,7 +1281,8 @@ def summarize_transcript(
         and Action Items table.
 
     Raises:
-        ValueError: if ``ollama_host`` is missing and no env default
+        ValueError: if neither or both of ``file`` and ``content`` are
+            provided, if ``ollama_host`` is missing and no env default
             is configured, if the file cannot be located or ingested
             (unknown format, unreadable), or if Ollama is unreachable
             / either model is not pulled on the host. All loaded
@@ -1260,6 +1291,16 @@ def summarize_transcript(
             formatting) fails. All loaded models are unloaded before
             the exception propagates.
     """
+    # Require exactly one of the two input sources. Both-or-neither
+    # both fail with the same error so MCP clients get a consistent
+    # "pick one" signal.
+    if (file is None) == (content is None):
+        raise ValueError(
+            "Exactly one of `file` or `content` must be provided. "
+            "Pass `file` as a URL / data URI / server path, OR pass "
+            "`content` as the raw transcript text body."
+        )
+
     # Resolve host. Explicit arg > env > fail.
     host = (ollama_host or DEFAULT_OLLAMA_HOST or "").strip()
     if not host:
@@ -1281,18 +1322,34 @@ def summarize_transcript(
     for m in models_used:
         _ALL_MODELS_EVER_LOADED.add((host, m))
 
-    # Resolve the ``file`` arg to a local file in tempdir. Handles
-    # base64 data URIs, http(s) URLs, or plain server paths. Raises
-    # ValueError for unknown prefixes / missing paths / failed fetches.
-    # See ``_materialize_input``.
+    # Resolve the input source to a local file in tempdir. Two paths:
+    #   * `content` — write the raw string to a .md (or .rtf if it
+    #     begins with '{\rtf'), then let step 1 ingest it normally.
+    #     Step 1's .md branch passes already-canonical markdown through
+    #     unchanged, so no new pipeline code is needed here.
+    #   * `file` — hand off to ``_materialize_input`` which handles
+    #     data URIs, http(s) URLs, or server filesystem paths.
     raw_dir = tempdir / "raw_files"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        input_path = _materialize_input(file, raw_dir)
-    except ValueError:
-        # Nothing loaded yet — just clean the tempdir and re-raise.
-        shutil.rmtree(tempdir, ignore_errors=True)
-        raise
+    if content is not None:
+        # Very loose RTF sniff — a real RTF always starts with the
+        # literal bytes `{\rtf`. Anything else is treated as markdown
+        # / plain text, which step 1's .md handler can pass through
+        # when it's in canonical `**Speaker N:**` form.
+        ext = ".rtf" if content.lstrip().startswith(r"{\rtf") else ".md"
+        input_path = raw_dir / f"upload{ext}"
+        try:
+            input_path.write_text(content, encoding="utf-8")
+        except OSError as e:
+            shutil.rmtree(tempdir, ignore_errors=True)
+            raise ValueError(f"Failed to stage `content` to tempdir: {e}") from e
+    else:
+        try:
+            input_path = _materialize_input(file, raw_dir)
+        except ValueError:
+            # Nothing loaded yet — just clean the tempdir and re-raise.
+            shutil.rmtree(tempdir, ignore_errors=True)
+            raise
 
     # Terminal banner so CLI operators watching `uv run app.py` see a
     # clear start / end for each MCP call. Mirrors main.py's
@@ -1445,11 +1502,11 @@ def build_demo() -> gr.Blocks:
 
             gr.Markdown("# Meeting Transcription Summarizer (Local)")
             gr.Markdown(
-                "Upload an exported meeting transcript (`.rtf`) from "
-                "[moonshine-notetaker](https://note-taker.moonshine.ai/) or "
-                "from the zz's local transcriber (`.md`). Files above 10 MB "
-                "are rejected; ~2.5h of speech is the practical ceiling "
-                "(LLM context window)."
+                "Upload a meeting transcript as **`.rtf`** "
+                "(from [moonshine-notetaker](https://note-taker.moonshine.ai/)) "
+                "or **`.md`** (from the zz's local transcriber). "
+                "Max 10 MB; practical ceiling is ≈2.5h of speech "
+                "(the LLM's context window)."
             )
 
             with gr.Accordion("Good to know", open=True):
@@ -1461,8 +1518,13 @@ def build_demo() -> gr.Blocks:
                     "ENGLISH GIVES BEST RESULTS"
                 )
 
+            # Label carries the file-type + size constraint so it's
+            # visible on the dropzone itself, not just in the prose
+            # above. file_types also filters the native file picker,
+            # but drag-and-drop still accepts anything — step 1 will
+            # reject unknown formats with a clear error_md message.
             upload = gr.File(
-                label="Transcript",
+                label="Transcript  ·  .rtf or .md  ·  max 10 MB",
                 file_types=[".rtf", ".md"],
                 file_count="single",
                 elem_id="transcript-upload",
@@ -1903,20 +1965,25 @@ def main() -> None:
 
     # Also rebind summarize_transcript's frozen defaults so MCP callers
     # that omit the args pick up the CLI-chosen models. __defaults__ is
-    # a tuple (file, editor_model, extractor_model, ollama_host,
-    # speaker_map) for the signature
-    # (file, editor_model=..., extractor_model=..., ollama_host=None,
-    #  speaker_map=None). We only rewrite the two model slots; the
-    # ollama_host default stays None (function reads DEFAULT_OLLAMA_HOST
-    # from the module namespace at call-time, not sig-time).
+    # a tuple (file, content, editor_model, extractor_model,
+    # ollama_host, speaker_map) for the signature
+    # (file=None, content=None, editor_model=..., extractor_model=...,
+    #  ollama_host=None, speaker_map=None). We only rewrite the two
+    # model slots; file/content/ollama_host/speaker_map stay None
+    # (summarize_transcript reads DEFAULT_OLLAMA_HOST from the module
+    # namespace at call-time, not sig-time).
     old_defaults = summarize_transcript.__defaults__
     if old_defaults is not None:
-        # (editor_model, extractor_model, ollama_host, speaker_map)
+        # (file, content, editor_model, extractor_model, ollama_host,
+        #  speaker_map) — six entries now that `file` and `content`
+        # are both optional (None-default) input sources.
         summarize_transcript.__defaults__ = (
+            old_defaults[0],  # file           — unchanged (None)
+            old_defaults[1],  # content        — unchanged (None)
             DEFAULT_EDITOR_MODEL,
             DEFAULT_EXTRACTOR_MODEL,
-            old_defaults[2],  # ollama_host — unchanged (None)
-            old_defaults[3],  # speaker_map — unchanged (None)
+            old_defaults[4],  # ollama_host    — unchanged (None)
+            old_defaults[5],  # speaker_map    — unchanged (None)
         )
 
     if not DEFAULT_OLLAMA_HOST:

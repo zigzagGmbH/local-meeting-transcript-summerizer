@@ -348,7 +348,8 @@ Launching with `uv run app.py` also boots an MCP server at `/gradio_api/mcp/` th
 
 ```text
 summarize_transcript(
-    file: str,
+    file: str | None = None,
+    content: str | None = None,
     editor_model: str = "gemma4:26b",
     extractor_model: str = "gemma4:26b",
     ollama_host: str | None = None,
@@ -356,14 +357,16 @@ summarize_transcript(
 ) -> str
 ```
 
-Returns the final meeting-minutes markdown as a plain string. Raises `ValueError` for bad config / unreachable Ollama / unknown format, and `RuntimeError` for mid-pipeline failures. In all cases the models loaded during the call are unloaded and the per-call tempdir is removed before the exception propagates.
+Exactly one of `file` (by reference) or `content` (by value) must be provided. Returns the final meeting-minutes markdown as a plain string. Raises `ValueError` for bad config / unreachable Ollama / unknown format / missing-or-duplicate input source, and `RuntimeError` for mid-pipeline failures. In all cases the models loaded during the call are unloaded and the per-call tempdir is removed before the exception propagates.
 
 > [!Warning]
 > **Speaker-map quality matters for MCP calls.** There is no human in the loop, so step 3 (speaker mapping) is effectively a no-op unless you pass a `speaker_map`. Generic `Speaker N` tags left untranslated can lead to mis-attributed action items. For best results, either pre-name speakers in the transcript source, or pass `speaker_map={"Speaker 1": "Alice", "Speaker 2": "Bob"}` along with the `file` argument.
 
-#### The `file` argument — three formats
+#### Input sources — `file` (by reference) vs `content` (by value)
 
-MCP clients don't always share a filesystem with the server, so `file` accepts three different string formats and picks the right path internally:
+MCP clients don't all have the same access to your transcripts. Some can pass a file path or URL, some can only paste text. So the tool accepts two input parameters; **exactly one must be provided**.
+
+**`file` — three reference formats for clients that can point at the transcript:**
 
 | Prefix | Meaning | Example |
 | :--- | :--- | :--- |
@@ -371,7 +374,22 @@ MCP clients don't always share a filesystem with the server, so `file` accepts t
 | `http://...` or `https://...` | Public URL the server can fetch via `httpx`. Best for cross-machine calls. | `http://192.168.30.119:8000/yt_video_en.md` |
 | anything else | Absolute path on the **server's** filesystem (NOT the MCP client's). Must exist. | `/home/user/transcripts/meeting.rtf` |
 
-Unknown prefixes and missing files produce a clear `ValueError` quoting the received value — typos like `file: http://...` (the literal label text leaking into the value) surface immediately rather than silently misclassifying.
+**`content` — raw transcript text for clients that only have the extracted body:**
+
+```python
+summarize_transcript(
+    content="**Speaker 1:** Hello everyone, let's kick off...\n**Speaker 2:** Thanks...",
+    speaker_map={"Speaker 1": "Alice", "Speaker 2": "Bob"},
+)
+```
+
+The string is written to a per-call tempfile (`.rtf` if it begins with `{\rtf`, else `.md`) and fed to step 1 just like an uploaded file would be. Step 1's markdown handler passes already-canonical `**Speaker N:**` content through unchanged, so the LLM's output quality is identical to a real file upload when the content is clean.
+
+**When to use which:**
+- Use `file` when your MCP client can give you a URL, path, or lets you base64-encode uploads — Claude Desktop, the MCP Inspector, anything on a shared filesystem. Preserves original RTF formatting if you go that route.
+- Use `content` when your MCP client extracts file text into the LLM's context but doesn't expose a file handle. Open WebUI falls in this bucket today (see [Watching upstream — issue #12228](#watching-upstream--open-webui-issue-12228)).
+
+**Unknown / missing values** produce a clear `ValueError`. Passing neither, or both, both produce the same "exactly one must be provided" message. Typos in `file` like `file: http://...` (the literal label text leaking into the value) surface immediately rather than silently misclassifying.
 
 #### Cross-machine topology
 
@@ -709,8 +727,9 @@ Every `(host, model)` pair ever loaded during the process's lifetime is tracked 
 - [x] Gradio with simple API and MCP (local testing — Tests 1–3).
 - [x] Test MCP with remote / cross-machine file transfer (Test 4: Gradio on ziggie, MCP Inspector on Mac, transcript hosted from Mac via `python -m http.server`, pipeline ran on ziggie's GPUs, summary returned across the LAN).
 - [x] Deploy in Docker — CPU-only image on ziggie, reachable at `ziggie.is:2070`, talks to Ollama via `ziggie-net` container DNS. See [Docker Deployment](#docker-deployment).
-- [ ] Test tool-calling from Open WebUI — native MCP Streamable HTTP connection (no `mcpo` bridge needed; we speak Streamable HTTP directly). Upload-in-chat UX is blocked on [upstream #12228](#watching-upstream--open-webui-issue-12228); URL-paste workaround works today.
-- ---
+- [ ] Test tool-calling from Open WebUI — native MCP Streamable HTTP connection (no `mcpo` bridge needed; we speak Streamable HTTP directly). Upload-in-chat UX works today via the `content=` parameter; see [Watching upstream — #12228](#watching-upstream--open-webui-issue-12228) for the long-form writeup and what improves once Open WebUI ships file-URL exposure.
+
+---
 
 ## Watching upstream — [Open WebUI issue #12228](https://github.com/open-webui/open-webui/issues/12228)
 
@@ -726,7 +745,7 @@ Issue #12228, titled *"feat: uploading files without backend processing"*, asks 
 
 ### What lands in our lap the day it ships
 
-The fix is nearly free for us, because our MCP tool already accepts a URL as the `file` argument (see [The `file` argument — three formats](#the-file-argument--three-formats)). Once Open WebUI exposes uploaded files via a URL, the topology becomes:
+The fix is nearly free for us, because our MCP tool already accepts a URL as the `file` argument (see [Input sources](#input-sources--file-by-reference-vs-content-by-value)). Once Open WebUI exposes uploaded files via a URL, the topology becomes:
 
 ```mermaid
 graph LR
@@ -753,7 +772,35 @@ graph LR
     class TOOL,PIPE tool;
 ```
 
-Zero code changes on our side. The `http(s)://...` branch of `_materialize_input` already streams the file down via `httpx` before handing off to step 1. Whatever URL shape Open WebUI picks (signed, session-scoped, whatever) just flows through.
+Zero code changes on our side for the URL-based route. The `http(s)://...` branch of `_materialize_input` already streams the file down via `httpx` before handing off to step 1. Whatever URL shape Open WebUI picks (signed, session-scoped, whatever) just flows through. The main win is that the LLM's context window stays clean — no big transcript text cluttering it up as intermediate state.
+
+### Today's workarounds (even before #12228 lands)
+
+#### 1. Paste extracted text directly via `content=` (recommended)
+
+Our MCP tool has a `content` parameter that accepts raw transcript text as a string — see [Input sources](#input-sources--file-by-reference-vs-content-by-value). This is exactly the shape Open WebUI already gives Gemma: the file's extracted text, sitting in the chat context. Gemma just copies it into the tool call:
+
+```
+You: [uploads meeting.md]
+You: summarize this meeting
+Gemma: [calls summarize_transcript(
+          content="<the entire transcript text Open WebUI put in my context>",
+          speaker_map={"Speaker 1": "Alice"},
+        )]
+Gemma: [pastes the returned markdown summary into chat]
+```
+
+Works today, no upstream fix needed. Quality trade-off: for `.md` uploads from our local transcriber the round-trip is lossless. For Moonshine `.rtf` uploads, Open WebUI's RTF-to-text extractor may lose speaker labels — if action items come back with `(unnamed)` owners, pass a `speaker_map` so the extraction step still gets attribution right.
+
+#### 2. Share a LAN URL
+
+If you want the LLM to fetch the transcript itself (no text in context, no token cost), serve it from your laptop with `python3 -m http.server 8000`, paste the URL into chat, and ask Gemma to call the tool with `file=<URL>`. See [Cross-machine topology](#cross-machine-topology) for the exact setup. Best for very long transcripts that would blow the LLM's context budget if pasted inline via `content=`.
+
+#### 3. Open WebUI Filter Function (advanced, rarely needed)
+
+Most invasive, most automated — a Python plugin running inside Open WebUI that intercepts uploads before extraction and pre-fills the `content=` argument automatically, so the user doesn't even have to ask Gemma to call the tool by name. We own a maintenance surface in someone else's codebase. Only worth it if `content=` + a good system prompt doesn't automate the flow reliably enough.
+
+So #12228 would be nice (cleaner LLM context, signed-URL access), but it's no longer a blocker. The `content=` workaround covers the Open WebUI demo path cleanly today.
 
 
 ---
