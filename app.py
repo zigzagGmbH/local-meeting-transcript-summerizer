@@ -1177,10 +1177,38 @@ def _materialize_input(src: str, dest_dir: Path) -> Path:
         return out
 
     # Otherwise: a path on the server's filesystem.
-    p = Path(src)
-    if not p.exists():
+    #
+    # Defensive pre-filter: if the caller pasted raw transcript text
+    # into `file` by mistake (common MCP-client footgun), the string
+    # will contain newlines and/or be enormous. Reject those early
+    # with a clean ValueError that points them at `content=`, instead
+    # of letting os.stat() throw ENAMETOOLONG / ENAMETOOLONG-like
+    # OSErrors that surface as ugly stack traces to the MCP client.
+    if "\n" in src or len(src) > 4096:
+        preview = src[:80].replace("\n", " ") + ("…" if len(src) > 80 else "")
         raise ValueError(
-            f"Unrecognised `file` argument {src!r} — expected a "
+            f"`file` argument doesn't look like a path, URL, or data URI "
+            f"(got {len(src)} chars starting with {preview!r}). If you "
+            f"meant to pass raw transcript text, use the `content` "
+            f"parameter instead of `file`."
+        )
+    p = Path(src)
+    try:
+        exists = p.exists()
+    except OSError as e:
+        # Path-like string the OS can't even stat (too long, bad
+        # chars, etc.). Treat as "not a valid path" and point the
+        # caller at the right parameter.
+        preview = src[:80] + ("…" if len(src) > 80 else "")
+        raise ValueError(
+            f"`file` argument {preview!r} is not a valid filesystem path "
+            f"({type(e).__name__}: {e}). If you meant to pass raw "
+            f"transcript text, use the `content` parameter instead."
+        ) from e
+    if not exists:
+        preview = src[:80] + ("…" if len(src) > 80 else "")
+        raise ValueError(
+            f"Unrecognised `file` argument {preview!r} — expected a "
             f"'data:...', 'http(s)://...', or an existing local path on "
             f"the server's filesystem."
         )
