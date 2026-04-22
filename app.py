@@ -44,7 +44,13 @@ import gradio as gr
 import httpx
 from dotenv import load_dotenv
 
-from pipeline import announce
+from pipeline import (
+    announce,
+    announce_done,
+    announce_start,
+    announce_unload,
+    announce_unload_result,
+)
 from pipeline.step1_convert import convert
 from pipeline.step2_cleanup import clean_transcript
 from pipeline.step3_mapping import apply_speaker_mapping
@@ -808,6 +814,27 @@ def run_pipeline_generator(
             gr.update(visible=stop_visible),  # stop_btn
         )
 
+    def _announce_to_panel(call: Callable[[], None]) -> None:
+        """Run an announcer helper with stdout redirected into the UI
+        log panel AND the terminal at once.
+
+        Announcer helpers (announce_start / announce_done /
+        announce_unload / announce_unload_result) only ``print()`` to
+        stdout. Inside a step, ``_stream_step`` already redirects
+        stdout into the polled buffer that feeds state_val['log_text'].
+        But announcer calls made by the main generator thread — start,
+        done, and the finally block — run outside that capture, so the
+        UI log panel wouldn't see them without explicit teeing. This
+        helper is that tee: capture into a StringIO, append to
+        log_text, and also forward to the real stdout so docker logs
+        still get the line.
+        """
+        buf = io.StringIO()
+        tee = _Tee(buf, sys.stdout)
+        with contextlib.redirect_stdout(cast(TextIO, tee)):
+            call()
+        state_val["log_text"] += buf.getvalue()
+
     # ── Pre-flight: no transcript ────────────────────────────────────────
     if not state_val.get("canonical_md"):
         yield (
@@ -855,6 +882,21 @@ def run_pipeline_generator(
     state_val["log_text"] = ""
     state_val["progress_pct"] = 0
     state_val["progress_phase"] = ""
+
+    # Start banner — same shape as the MCP path so `docker compose
+    # logs` tells the same story regardless of how the run was
+    # invoked. Uses the uploaded stem when available (matches what
+    # the user sees in the UI) and falls back to the canonical-md
+    # filename otherwise.
+    src_label = state_val.get("uploaded_stem") or canonical_md_path.name
+    _announce_to_panel(lambda: announce_start("Gradio UI run", src_label))
+
+    # Track whether the success branch already did its own unload
+    # announcements (via _announce_to_panel, so they reach the UI log
+    # panel). The finally block below checks this so we don't
+    # double-unload on success, but still do a clean announcement on
+    # exception or GeneratorExit (Stop button).
+    unloaded_in_success_path = False
 
     try:
         # ── Step 1/4 in the UI's counting (step 2 in the pipeline):
@@ -952,6 +994,37 @@ def run_pipeline_generator(
         # into the "Rendered" state.
         state_val["progress_pct"] = 100
         state_val["progress_phase"] = "Done"
+        # Success banner — identical line to the MCP path's
+        # announce_done(...), just a different destination clause. The
+        # _announce_to_panel wrapper tees it into state_val['log_text']
+        # so the browser log panel sees it too, not just the terminal.
+        _announce_to_panel(
+            lambda: announce_done(len(final_content), "Rendered in Web UI")
+        )
+
+        # Unload models IN-LINE (not in the finally block) on the
+        # success path. Two reasons:
+        #   1. The browser log panel only sees state_val["log_text"]
+        #      writes that happen BEFORE the final yield. Anything in
+        #      the finally block (which runs after the generator is
+        #      exhausted) hits the terminal only, never the UI panel.
+        #   2. The finally block remains as a safety net for the
+        #      exception and GeneratorExit (Stop button) paths — a
+        #      local flag below makes sure we don't double-unload.
+        session_models = list(state_val.get("models_used", ()))
+        _announce_to_panel(lambda: announce_unload(ollama_host, session_models))
+        for m in session_models:
+            try:
+                unload_model(ollama_host, m)
+                _announce_to_panel(lambda m=m: announce_unload_result(m, ok=True))
+            except Exception as e:
+                _announce_to_panel(
+                    lambda m=m, e=e: announce_unload_result(
+                        m, ok=False, error=str(e)
+                    )
+                )
+        unloaded_in_success_path = True
+
         yield (
             gr.update(visible=True),  # console_group
             gr.update(value=_progress_value("✅ Done", 100)),  # progress_label
@@ -991,8 +1064,20 @@ def run_pipeline_generator(
 
     finally:
         state_val["run_in_progress"] = False
-        for m in list(state_val.get("models_used", ())):
-            unload_model(ollama_host, m)
+        # VRAM cleanup path for exception + GeneratorExit (Stop button)
+        # only — the success path already unloaded in-line (see above)
+        # so its announcements reach the UI log panel, not just the
+        # terminal. Python's finally always runs; the flag skips the
+        # body cleanly on success.
+        if not unloaded_in_success_path:
+            session_models = list(state_val.get("models_used", ()))
+            announce_unload(ollama_host, session_models)
+            for m in session_models:
+                try:
+                    unload_model(ollama_host, m)
+                    announce_unload_result(m, ok=True)
+                except Exception as e:
+                    announce_unload_result(m, ok=False, error=str(e))
 
 
 # ─── MCP-exposed tool ──────────────────────────────────────────────────
@@ -1180,9 +1265,11 @@ def summarize_transcript(
 
     # Terminal banner so CLI operators watching `uv run app.py` see a
     # clear start / end for each MCP call. Mirrors main.py's
-    # "Starting Pipeline for: ..." line.
-    print(f"\n🔨 MCP summarize_transcript: {input_path.name}")
-    print("-" * 40)
+    # "Starting Pipeline for: ..." line. Shape is shared with the UI
+    # path via pipeline.announce_start / announce_done /
+    # announce_unload(_result) so both entry points produce identical
+    # log output.
+    announce_start("MCP summarize_transcript", input_path.name)
 
     try:
         # ── Step 1/5: ingest ──────────────────────────────────────────────────
@@ -1235,12 +1322,9 @@ def summarize_transcript(
 
         final_text = final_path.read_text(encoding="utf-8")
 
-        # Closing banner — CLI parity with main.py's "Pipeline Complete".
-        print("-" * 40)
-        print(
-            f"✅ Summary ready ({len(final_text):,} chars). "
-            f"Returning to MCP client."
-        )
+        # Closing banner — matches announce_start's separator; the UI
+        # path emits the same line via announce_done below.
+        announce_done(len(final_text), "Returning to MCP client")
         return final_text
 
     except ValueError:
@@ -1256,16 +1340,17 @@ def summarize_transcript(
         ) from e
     finally:
         # Eject models on every exit path — success, raise, or cancel.
-        # unload_model swallows transport errors so this never masks
-        # the real exception. Print each attempt so CLI operators see
-        # the cleanup happen (mirrors main.py's unload confirmations).
-        print("\nEjecting models from VRAM...")
+        # unload_model swallows transport errors so we re-do the HTTP
+        # call here behind try/except to know whether to report
+        # success or a note. Shared announcer helpers keep the
+        # terminal output identical to the UI path.
+        announce_unload(host, models_used)
         for m in models_used:
             try:
                 unload_model(host, m)
-                print(f"  - Successfully unloaded: {m}")
+                announce_unload_result(m, ok=True)
             except Exception as e:
-                print(f"  - Note: could not confirm unload for {m}: {e}")
+                announce_unload_result(m, ok=False, error=str(e))
         shutil.rmtree(tempdir, ignore_errors=True)
 
 
