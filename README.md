@@ -372,7 +372,7 @@ MCP clients don't all have the same access to your transcripts. Some can pass a 
 | :--- | :--- | :--- |
 | `data:<mime>;base64,<payload>` | Inline base64 of the file contents. `.rtf` if mime contains `rtf`, else `.md`. Fine for small transcripts. | `data:text/markdown;base64,IyMgTWVl…` |
 | `http://...` or `https://...` | Public URL the server can fetch via `httpx`. Best for cross-machine calls. | `http://192.168.30.119:8000/yt_video_en.md` |
-| anything else | Absolute path on the **server's** filesystem (NOT the MCP client's). Must exist. | `/home/user/transcripts/meeting.rtf` |
+| anything else | Absolute path on the **server's** filesystem (NOT the MCP client's). Must exist. Strings containing newlines or longer than 4 KB are rejected immediately with a pointer to `content=`, so accidentally pasting raw transcript text here produces a clean error rather than a path-too-long stack trace. | `/home/user/transcripts/meeting.rtf` |
 
 **`content` — raw transcript text for clients that only have the extracted body:**
 
@@ -727,7 +727,7 @@ Every `(host, model)` pair ever loaded during the process's lifetime is tracked 
 - [x] Gradio with simple API and MCP (local testing — Tests 1–3).
 - [x] Test MCP with remote / cross-machine file transfer (Test 4: Gradio on ziggie, MCP Inspector on Mac, transcript hosted from Mac via `python -m http.server`, pipeline ran on ziggie's GPUs, summary returned across the LAN).
 - [x] Deploy in Docker — CPU-only image on ziggie, reachable at `ziggie.is:2070`, talks to Ollama via `ziggie-net` container DNS. See [Docker Deployment](#docker-deployment).
-- [ ] Test tool-calling from Open WebUI — native MCP Streamable HTTP connection (no `mcpo` bridge needed; we speak Streamable HTTP directly). Upload-in-chat UX works today via the `content=` parameter; see [Watching upstream — #12228](#watching-upstream--open-webui-issue-12228) for the long-form writeup and what improves once Open WebUI ships file-URL exposure.
+- [x] Test tool-calling from Open WebUI — native MCP Streamable HTTP connection (no `mcpo` bridge needed; we speak Streamable HTTP directly). Upload-in-chat UX validated end-to-end on ziggie's Open WebUI with `.md` transcripts + Gemma 26B via the `content=` parameter. See [Watching upstream — #12228](#watching-upstream--open-webui-issue-12228) for the long-form writeup and what improves once Open WebUI ships file-URL exposure.
 
 ---
 
@@ -791,6 +791,34 @@ Gemma: [pastes the returned markdown summary into chat]
 ```
 
 Works today, no upstream fix needed. Quality trade-off: for `.md` uploads from our local transcriber the round-trip is lossless. For Moonshine `.rtf` uploads, Open WebUI's RTF-to-text extractor may lose speaker labels — if action items come back with `(unnamed)` owners, pass a `speaker_map` so the extraction step still gets attribution right.
+
+**Validated end-to-end** (April 2026): an `.md` transcript uploaded to ziggie's Open WebUI, passed to Gemma 26B, then through `summarize_transcript(content=...)` produced a clean summary with correct speaker attribution. A side echo-back test showed Gemma's own re-typing of the transcript into the tool-call JSON introduces minor noise (~<1% word-level drift — added / missing `and`s, one `Zerosny → Zersny` typo across ten speaker-label headings); step 2 (cleanup) absorbs that noise as part of its normal fillers-and-stutters pass, so final summary quality is indistinguishable from a direct file upload via the Web UI.
+
+**Suggested system prompt for Gemma4 in Open WebUI:**
+
+```text
+When the user uploads a meeting transcript and asks for a summary,
+call the summarize_transcript tool. Pass the uploaded file's text
+verbatim as the `content` argument — do not trim, clean, or
+reformat the transcript before passing it. If you can identify
+speakers' real names from context, pass them as `speaker_map`
+like {"Speaker 1": "Alice", "Speaker 2": "Bob"}. Paste the
+returned markdown summary verbatim into your reply — do not
+re-summarize the summary.
+```
+
+With that system prompt in place, the user's chat message can be as short as `summarize this` after an upload — the system prompt drives the rest.
+
+> [!Warning]
+> When uploading document to `openwebui` chat (with LLM set to `gemma4:26B`), do not forget to toggle ON `Use Entire Document`
+> ![alt text](assets/use_entire_doc.png)
+
+**Practical size guidance.** The `content=` path works well for transcripts up to ~30-40 minutes of talk (~3-4k words). Beyond that, two problems stack:
+
+1. The transcript crowds out Gemma's ~32k-token context window, leaving little room for the tool schema, prior turns, and the response itself.
+2. Gemma must emit the full transcript as its tool-call output. Ollama's default `num_predict` is 128, which silently truncates the JSON mid-transcript and produces a malformed tool call. Bump it to 8000–16000 in your Open WebUI model settings if you're getting "tool call was cut off" errors on longer meetings.
+
+For very long meetings, prefer workaround **LAN URL** below — a URL is ~50 tokens regardless of file size, so the LLM's context window stays uncrowded and there's no output-token-budget risk.
 
 #### 2. Share a LAN URL
 
