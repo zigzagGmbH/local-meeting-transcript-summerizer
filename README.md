@@ -3,6 +3,7 @@
 > [!Note]
 > A multi-agent, privacy-first pipeline that turns raw meeting transcripts into polished, corporate-grade meeting minutes using local LLMs (Gemma / Qwen) via Ollama. Accepts `.rtf` exports from [Moonshine.ai](https://note-taker.moonshine.ai/) **and** `.md` exports from our local transcriber — step 1 auto-detects the format and normalises both into the same canonical speaker-tagged markdown before the LLM agents run. Nothing leaves your network.
 
+
 ---
 
 ## Architecture at a glance
@@ -707,7 +708,52 @@ Every `(host, model)` pair ever loaded during the process's lifetime is tracked 
 - [x] Gradio with simple API and MCP (local testing — Tests 1–3).
 - [x] Test MCP with remote / cross-machine file transfer (Test 4: Gradio on ziggie, MCP Inspector on Mac, transcript hosted from Mac via `python -m http.server`, pipeline ran on ziggie's GPUs, summary returned across the LAN).
 - [x] Deploy in Docker — CPU-only image on ziggie, reachable at `ziggie.is:2070`, talks to Ollama via `ziggie-net` container DNS. See [Docker Deployment](#docker-deployment).
-- [ ] Test with tool-calling features from Open WebUI (via `mcpo` bridge).
+- [ ] Test tool-calling from Open WebUI — native MCP Streamable HTTP connection (no `mcpo` bridge needed; we speak Streamable HTTP directly). Upload-in-chat UX is blocked on [upstream #12228](#watching-upstream--open-webui-issue-12228); URL-paste workaround works today.
+- ---
+
+## Watching upstream — [Open WebUI issue #12228](https://github.com/open-webui/open-webui/issues/12228)
+
+> [!Important]
+> **Status as of April 2026:** OPEN. Filed on 31 March 2025 by `wangjiyang`, assigned to `tjbck` (Open WebUI project lead), with no labels, no linked PR, and no development branch. It's sitting in the backlog with no ETA.
+
+There's one piece of our UX that's blocked on Open WebUI, not on us: **drag a transcript into the chat window, let Gemma call our `summarize_transcript` tool automatically, get the summary back in the conversation.** Today, Open WebUI intercepts every file uploaded to a chat, runs it through RAG / OCR / text extraction, and injects the *extracted text* into the LLM's context prompt. The LLM (Gemma, in our case) therefore never sees the file as a handle — only as a pile of text already in its context — so when it tries to call our tool it has no path, URL, or base64 payload to pass as the `file=` argument. The natural UX falls apart at that boundary.
+
+Issue #12228, titled *"feat: uploading files without backend processing"*, asks for exactly the two things that would fix this:
+
+1. **Bypass Open WebUI's content-extraction pipeline entirely** when the user uploads a file — no RAG, no OCR, no text injection into the prompt.
+2. **Expose the raw uploaded file to tools / pipelines via a URL** that the backend can fetch.
+
+### What lands in our lap the day it ships
+
+The fix is nearly free for us, because our MCP tool already accepts a URL as the `file` argument (see [The `file` argument — three formats](#the-file-argument--three-formats)). Once Open WebUI exposes uploaded files via a URL, the topology becomes:
+
+```mermaid
+graph LR
+    USER["User drags transcript<br/>into Open WebUI chat"]
+    OWUI["Open WebUI<br/>(with #12228 shipped)"]
+    GEMMA["Gemma 26B"]
+    TOOL["summarize_transcript<br/>(MCP)"]
+    PIPE["Pipeline → Ollama"]
+
+    USER -->|upload .rtf / .md| OWUI
+    OWUI -->|"exposes: http://owui-host/uploads/abc123/meeting.rtf"| GEMMA
+    GEMMA -->|"summarize_transcript(file='http://.../meeting.rtf')"| TOOL
+    TOOL --> PIPE
+    PIPE -->|markdown summary| GEMMA
+    GEMMA -->|"Here's the summary:\n\n[markdown]"| USER
+
+    classDef user fill:#00b894,stroke:#000,color:#fff;
+    classDef owui fill:#fdcb6e,stroke:#000,color:#000;
+    classDef llm fill:#6c5ce7,stroke:#000,color:#fff;
+    classDef tool fill:#0984e3,stroke:#000,color:#fff;
+    class USER user;
+    class OWUI owui;
+    class GEMMA llm;
+    class TOOL,PIPE tool;
+```
+
+Zero code changes on our side. The `http(s)://...` branch of `_materialize_input` already streams the file down via `httpx` before handing off to step 1. Whatever URL shape Open WebUI picks (signed, session-scoped, whatever) just flows through.
+
 
 ---
 
