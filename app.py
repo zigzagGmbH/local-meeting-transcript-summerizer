@@ -24,6 +24,7 @@ This pass (M6.5 round 4):
 
 from __future__ import annotations
 
+import argparse
 import atexit
 import base64
 import contextlib
@@ -37,7 +38,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, TextIO, cast
 
 import gradio as gr
 import httpx
@@ -270,7 +271,7 @@ COPY_SUMMARY_JS = """
 # ─── Threaded log streaming ──────────────────────────────────────────────
 
 
-class _Tee:
+class _Tee(io.TextIOBase):
     """Write-only stream that fans out to multiple underlying streams.
 
     Used so step prints land in BOTH our polling buffer (for the UI log
@@ -311,9 +312,9 @@ def _stream_step(
 
     Mutates ``state_val``:
         * ``state_val['log_text']`` — appended to with each poll's chunk
-          (initial log preserved so prior steps' output stays visible).
+        (initial log preserved so prior steps' output stays visible).
         * ``state_val[result_key]`` — set to ``fn``'s return value on
-          successful completion.
+        successful completion.
 
     Exceptions inside ``fn`` are re-raised from this generator when it
     exits, so callers can wrap the iteration in try/except and see the
@@ -348,7 +349,7 @@ def _stream_step(
     def _worker() -> None:
         try:
             tee = _Tee(buf, original_stdout)
-            with contextlib.redirect_stdout(tee):
+            with contextlib.redirect_stdout(cast(TextIO, tee)):
                 result[0] = fn()
         except BaseException as e:
             err[0] = e
@@ -1659,10 +1660,136 @@ def build_demo() -> gr.Blocks:
 # ─── Entry point ──────────────────────────────────────────────────────────
 
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """CLI flags for the Gradio + MCP server.
+
+    All flags are optional — ``uv run app.py`` with no args preserves the
+    pre-docker bare-metal behaviour (bind 0.0.0.0:7860, read OLLAMA_HOST
+    from env, default both models to ``gemma4:26b``).
+
+    The docker CMD injects ``--port 2070`` to pin the container to the
+    ziggie 20xx port band. The ``--host`` default (0.0.0.0) is already
+    what we want inside a container, so the CMD doesn't set it.
+
+    Precedence for each value: CLI flag > env var > hardcoded fallback.
+    """
+    parser = argparse.ArgumentParser(
+        prog="app.py",
+        description=(
+            "Gradio + MCP server for the Local Meeting Transcript "
+            "Summarizer. Runs on bare metal (no flags → http://localhost"
+            ":7860) or in a container (docker CMD injects --host/--port)."
+        ),
+    )
+
+    # ── Server binding ───────────────────────────────────────────────
+    # Defaults chosen so bare-metal `uv run app.py` preserves today's
+    # behaviour. Env vars honour Gradio's own conventions
+    # (GRADIO_SERVER_NAME / GRADIO_SERVER_PORT) so they also work if
+    # exported without flags.
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=os.environ.get("GRADIO_SERVER_NAME", SERVER_HOST),
+        help=(
+            "Gradio bind address. Default: $GRADIO_SERVER_NAME or "
+            f"{SERVER_HOST!r}."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("GRADIO_SERVER_PORT", SERVER_PORT)),
+        help=(
+            "Gradio bind port. Default: $GRADIO_SERVER_PORT or "
+            f"{SERVER_PORT}."
+        ),
+    )
+
+    # ── Pipeline defaults ────────────────────────────────────────────
+    # These override the module-level DEFAULT_* constants that both the
+    # sidebar widgets AND summarize_transcript's signature defaults read
+    # from. See main() for how the override is applied.
+    #
+    # Naming note: main.py's CLI calls its Ollama flag --host (its only
+    # host-ish concept). Here --host is the Gradio bind address, so we
+    # disambiguate the Ollama URL as --ollama-host. Slight divergence
+    # between the two entry points but each one's flags are internally
+    # consistent.
+    parser.add_argument(
+        "--ollama-host",
+        type=str,
+        default=os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
+        help=(
+            "Ollama server URL (used for connectivity probes, model "
+            "listing, and as the default passed to MCP callers that omit "
+            "the arg). Default: $OLLAMA_HOST. Hard-fails if empty."
+        ),
+    )
+    parser.add_argument(
+        "--editor-model",
+        type=str,
+        default=DEFAULT_EDITOR_MODEL,
+        help=(
+            "Default model for Cleanup (step 2). Shown in the sidebar; "
+            "also the default for MCP calls that omit editor_model. "
+            f"Default: {DEFAULT_EDITOR_MODEL!r}."
+        ),
+    )
+    parser.add_argument(
+        "--extractor-model",
+        type=str,
+        default=DEFAULT_EXTRACTOR_MODEL,
+        help=(
+            "Default model for Extraction (step 4) and Formatting (step "
+            "5). Shown in the sidebar; also the default for MCP calls "
+            f"that omit extractor_model. Default: {DEFAULT_EXTRACTOR_MODEL!r}."
+        ),
+    )
+
+    return parser.parse_args(argv)
+
+
 def main() -> None:
+    args = _parse_args()
+
+    # Apply CLI-resolved values by mutating the module-level DEFAULT_*
+    # constants. Ugly but unavoidable: summarize_transcript's signature
+    # defaults are frozen at function definition time (they read the
+    # constants at import), so we must update the constants before the
+    # MCP tool is registered via gr.api(). The sidebar widgets also read
+    # these constants for their initial value=.
+    #
+    # Bare-metal `uv run app.py` with no flags leaves everything pinned
+    # to the pre-mutation defaults (argparse defaults fall through to
+    # the original constant values).
+    global DEFAULT_OLLAMA_HOST, DEFAULT_EDITOR_MODEL, DEFAULT_EXTRACTOR_MODEL
+    DEFAULT_OLLAMA_HOST = (args.ollama_host or "").strip()
+    DEFAULT_EDITOR_MODEL = args.editor_model
+    DEFAULT_EXTRACTOR_MODEL = args.extractor_model
+
+    # Also rebind summarize_transcript's frozen defaults so MCP callers
+    # that omit the args pick up the CLI-chosen models. __defaults__ is
+    # a tuple (file, editor_model, extractor_model, ollama_host,
+    # speaker_map) for the signature
+    # (file, editor_model=..., extractor_model=..., ollama_host=None,
+    #  speaker_map=None). We only rewrite the two model slots; the
+    # ollama_host default stays None (function reads DEFAULT_OLLAMA_HOST
+    # from the module namespace at call-time, not sig-time).
+    old_defaults = summarize_transcript.__defaults__
+    if old_defaults is not None:
+        # (editor_model, extractor_model, ollama_host, speaker_map)
+        summarize_transcript.__defaults__ = (
+            DEFAULT_EDITOR_MODEL,
+            DEFAULT_EXTRACTOR_MODEL,
+            old_defaults[2],  # ollama_host — unchanged (None)
+            old_defaults[3],  # speaker_map — unchanged (None)
+        )
+
     if not DEFAULT_OLLAMA_HOST:
         print(
-            "Error: OLLAMA_HOST is missing. Please define it in a .env file.",
+            "Error: OLLAMA_HOST is missing. Pass --ollama-host or set "
+            "OLLAMA_HOST in .env / the environment.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1671,11 +1798,11 @@ def main() -> None:
 
     demo = build_demo()
     demo.launch(
-        server_name=SERVER_HOST,
-        server_port=SERVER_PORT,
+        server_name=args.host,
+        server_port=args.port,
         # Do not auto-open a browser tab. Matters for headless hosts
         # like ziggie where there IS no desktop, and is just noisy on
-        # Mac dev. Users hit http://<host>:7860 manually.
+        # Mac dev. Users hit http://<host>:<port> manually.
         inbrowser=False,
         theme=gr.Theme.from_hub("Nymbo/Nymbo_Theme"),
         css=CUSTOM_CSS,

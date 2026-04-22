@@ -1,0 +1,17 @@
+services:
+  meeting-summarizer:
+    build: .
+    container_name: meeting-summarizer
+    restart: unless-stopped
+    ports:
+      - "2070:2070"
+    environment:
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - /data/services/meeting-summarizer/outputs:/app/output
+    networks:
+      - ziggie-net
+networks:
+  ziggie-net:
+    external: true

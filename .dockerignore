@@ -1,0 +1,34 @@
+# Version control / CI metadata — not needed in the image.
+.git
+.gitignore
+
+# Local venv — the image builds its own via uv sync.
+.venv
+
+# Host-only env file. .env.template stays (small, useful at runtime as
+# reference) but .env is operator-specific and may contain the Ollama
+# URL for bare-metal dev, which is wrong for the container.
+.env
+
+# Bytecode / cache.
+__pycache__
+*.pyc
+*.pyo
+
+# Volume-mounted or runtime-generated dirs. NO need to copy these into
+# the image layer — they'd be hidden by the compose volume mount
+# anyway, and just bloat the build.
+output/
+transcripts/
+
+# Dev-time docs / specs / scratch. The runtime image doesn't need
+# them. README.md is kept (hatchling needs it — same pattern as
+# local-meeting-media-transcriber and local-translater).
+contexts/
+LICENSE
+
+# OS noise.
+.DS_Store
+*.log
+*.tmp
+*.bak
