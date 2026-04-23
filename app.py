@@ -1483,7 +1483,7 @@ def build_demo() -> gr.Blocks:
         speaker_map_state = gr.State({})
 
         # ── Sidebar ──────────────────────────────────────────────────────
-        with gr.Sidebar():
+        with gr.Sidebar(open=False):
             gr.Markdown("### Settings")
 
             gr.Markdown("**Ollama host**")
@@ -1537,7 +1537,7 @@ def build_demo() -> gr.Blocks:
                 "(the LLM's context window)."
             )
 
-            with gr.Accordion("Good to know", open=True):
+            with gr.Accordion("⚠️ IMPORTANT ⚠️", open=True):
                 gr.Markdown(
                     "Each tab runs independently — multiple tabs = multiple "
                     "queue slots. When you close the tab, the models your "
