@@ -74,7 +74,7 @@ LOG_PANEL_LINES = 12
 # Fixed preview/summary heights. Same height on summary + raw textbox so
 # the Rendered/Raw toggle doesn't jump the page.
 PREVIEW_HEIGHT = 400
-SUMMARY_HEIGHT = 500
+SUMMARY_HEIGHT = 1000
 SUMMARY_RAW_LINES = 20
 
 # Polling interval for the threaded stdout streamer (below). 0.3s is the
