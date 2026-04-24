@@ -1185,8 +1185,15 @@ def on_view_mode_pdf(
 
     # Cached — serve iframe immediately, enable download as PDF.
     if pdf_path and Path(pdf_path).exists():
+        # Gradio 6's static-file endpoint is `/gradio_api/file=<path>`
+        # (the plain `/file=` prefix from Gradio 4.x is no longer a
+        # reliable URL in 6.x). The path must also be whitelisted via
+        # `allowed_paths=` in demo.launch() — we pass
+        # `tempfile.gettempdir()` there so every per-session tempdir
+        # rooted under it (e.g. /tmp/meeting_summarizer_XXX) is
+        # reachable through this URL.
         iframe_html = (
-            f'<iframe src="/file={pdf_path}" '
+            f'<iframe src="/gradio_api/file={pdf_path}" '
             f'style="width: 100%; height: {SUMMARY_HEIGHT}px; border: 0;" '
             f'title="Meeting summary PDF"></iframe>'
         )
@@ -1243,8 +1250,9 @@ def on_view_mode_pdf(
         return
 
     state_val["final_summary_pdf_path"] = str(target_pdf)
+    # Same URL scheme as the cached branch above — see comment there.
     iframe_html = (
-        f'<iframe src="/file={target_pdf}" '
+        f'<iframe src="/gradio_api/file={target_pdf}" '
         f'style="width: 100%; height: {SUMMARY_HEIGHT}px; border: 0;" '
         f'title="Meeting summary PDF"></iframe>'
     )
@@ -2202,6 +2210,19 @@ def main() -> None:
         css=CUSTOM_CSS,
         max_file_size=UPLOAD_MAX_SIZE,
         mcp_server=True,
+        # M11: whitelist the tempfile root so the PDF iframe's
+        # `<iframe src="/gradio_api/file=/tmp/...">` URL resolves.
+        # Without this, Gradio 6 returns {"detail": "Not Found"} for
+        # arbitrary server paths (security hardening since 5.x). Our
+        # per-session tempdirs all sit under tempfile.gettempdir() —
+        # usually `/tmp` on Linux/macOS or `/var/folders/…` on some
+        # macOS configs — so whitelisting that root covers every
+        # session without leaking anything user-sensitive (the
+        # tempdir is process-scoped and cleaned up on session end).
+        # `DownloadButton` uses Gradio's internal file-token system,
+        # not this URL route, so it worked before this fix — only
+        # the iframe needed it.
+        allowed_paths=[tempfile.gettempdir()],
     )
 
 
