@@ -40,6 +40,7 @@ from pipeline import (
     announce_unload,
     announce_unload_result,
 )
+from pipeline.pdf_export import md_to_pdf
 from pipeline.step1_convert import convert
 from pipeline.step2_cleanup import clean_transcript
 from pipeline.step3_mapping import apply_speaker_mapping
@@ -191,10 +192,18 @@ CUSTOM_CSS = """
 /* Rendered/Raw toggle — display controlled by a class on the outer column
    (elem_id="summary-container"). Default: only the rendered markdown
    shows. When .view-raw is applied, the raw textbox shows and the
-   rendered markdown hides. */
+   rendered markdown hides. M11 adds .view-pdf as a third state: the
+   iframe shows, rendered + raw hide. Classes are mutually exclusive
+   (the JS toggle clears both before setting one). */
 #final-summary-source { display: none !important; }
 #summary-container.view-raw #final-summary-source { display: block !important; }
 #summary-container.view-raw #final-summary { display: none !important; }
+
+/* PDF mode (M11) — iframe shown, rendered markdown + raw textbox hidden. */
+#final-summary-pdf { display: none !important; }
+#summary-container.view-pdf #final-summary-pdf { display: block !important; }
+#summary-container.view-pdf #final-summary { display: none !important; }
+#summary-container.view-pdf #final-summary-source { display: none !important; }
 
 /* Refresh button: icon-only (no label text), sized to match inputs. */
 #test-btn button {
@@ -263,16 +272,18 @@ FORCE_DARK_MODE_JS = """
 }
 """
 
-# Radio toggle: pure JS, no Python roundtrip. Just flips a class on the
-# outer column.
+# Radio toggle: pure JS, no Python roundtrip. Flips mutually-exclusive
+# CSS classes on the outer column (.view-raw / .view-pdf). Default
+# state = neither class = rendered markdown shows.
 TOGGLE_VIEW_MODE_JS = """
 (mode) => {
     const container = document.getElementById('summary-container');
     if (!container) return;
+    container.classList.remove('view-raw', 'view-pdf');
     if (mode === 'Raw') {
         container.classList.add('view-raw');
-    } else {
-        container.classList.remove('view-raw');
+    } else if (mode === 'PDF') {
+        container.classList.add('view-pdf');
     }
 }
 """
@@ -282,10 +293,11 @@ TOGGLE_VIEW_MODE_JS = """
 # container to rendered mode AND programmatically clicks the Rendered
 # radio so its visible state matches the CSS (Gradio's radio .change()
 # doesn't fire on gr.update(value=...); the click() is the workaround).
+# M11: clears both .view-raw AND .view-pdf so a new run starts clean.
 RESET_VIEW_MODE_JS = """
 () => {
     const container = document.getElementById('summary-container');
-    if (container) container.classList.remove('view-raw');
+    if (container) container.classList.remove('view-raw', 'view-pdf');
     const renderedInput = document.querySelector('#view-mode input[value="Rendered"]');
     if (renderedInput && !renderedInput.checked) renderedInput.click();
 }
@@ -537,6 +549,7 @@ def init_session_state() -> dict[str, Any]:
         "canonical_md": None,
         "uploaded_stem": None,
         "final_summary_path": None,
+        "final_summary_pdf_path": None,  # M11: set on first PDF-radio click, cleared on new upload / new run.
         "models_used": set(),
         "ollama_host": DEFAULT_OLLAMA_HOST,
         "run_in_progress": False,
@@ -707,6 +720,7 @@ def on_file_upload(
         state_val["canonical_md"] = None
         state_val["uploaded_stem"] = None
         state_val["final_summary_path"] = None
+        state_val["final_summary_pdf_path"] = None
         state_val["log_text"] = ""
         state_val["progress_pct"] = 0
         state_val["progress_phase"] = ""
@@ -736,6 +750,7 @@ def on_file_upload(
         state_val["canonical_md"] = None
         state_val["uploaded_stem"] = None
         state_val["final_summary_path"] = None
+        state_val["final_summary_pdf_path"] = None
         state_val["log_text"] = ""
         state_val["progress_pct"] = 0
         state_val["progress_phase"] = ""
@@ -757,6 +772,7 @@ def on_file_upload(
     state_val["canonical_md"] = str(md_path)
     state_val["uploaded_stem"] = src.stem
     state_val["final_summary_path"] = None
+    state_val["final_summary_pdf_path"] = None
     state_val["log_text"] = ""
     state_val["progress_pct"] = 0
     state_val["progress_phase"] = ""
@@ -913,6 +929,8 @@ def run_pipeline_generator(
     state_val["log_text"] = ""
     state_val["progress_pct"] = 0
     state_val["progress_phase"] = ""
+    # M11: clear cached PDF path — a new run must regenerate on first PDF click.
+    state_val["final_summary_pdf_path"] = None
 
     # Start banner — same shape as the MCP path so `docker compose
     # logs` tells the same story regardless of how the run was
@@ -1112,6 +1130,134 @@ def run_pipeline_generator(
 
 
 # ─── MCP-exposed tool ──────────────────────────────────────────────────
+
+def on_view_mode_pdf(
+    mode: str,
+    state_val: dict[str, Any],
+) -> Iterator[tuple[Any, Any, dict[str, Any]]]:
+    """Handle view-mode radio changes that affect PDF display and the
+    download-button target.
+
+    Stacked alongside the JS-only ``view_mode.change`` listener
+    (``TOGGLE_VIEW_MODE_JS``) that flips CSS classes. This handler runs
+    in parallel, in Python, and owns two things:
+
+      * The iframe HTML in ``#final-summary-pdf``.
+      * The download button's target file + label + interactive state.
+
+    Generator semantics — yields once for non-PDF modes / cached-PDF
+    clicks, twice for first-PDF-click (placeholder + iframe).
+
+    Yield tuple order matches the ``outputs=`` list on the wiring site:
+      0. final_summary_pdf (HTML)
+      1. download_btn (DownloadButton)
+      2. session_state (State)
+    """
+    md_path = state_val.get("final_summary_path")
+
+    # ── Rendered / Raw modes ────────────────────────────────────────
+    # PDF iframe stays whatever it was (no update). Download button
+    # points at the .md. If there's no summary yet, button is
+    # disabled.
+    if mode != "PDF":
+        yield (
+            gr.update(),  # iframe unchanged
+            gr.update(
+                value=md_path if md_path else None,
+                label="Download",
+                interactive=bool(md_path),
+            ),
+            state_val,
+        )
+        return
+
+    # ── PDF mode ────────────────────────────────────────────────────
+    if not md_path:
+        # No summary run yet. Clear iframe, disable button.
+        yield (
+            gr.update(value=""),
+            gr.update(interactive=False),
+            state_val,
+        )
+        return
+
+    pdf_path = state_val.get("final_summary_pdf_path")
+
+    # Cached — serve iframe immediately, enable download as PDF.
+    if pdf_path and Path(pdf_path).exists():
+        iframe_html = (
+            f'<iframe src="/file={pdf_path}" '
+            f'style="width: 100%; height: {SUMMARY_HEIGHT}px; border: 0;" '
+            f'title="Meeting summary PDF"></iframe>'
+        )
+        yield (
+            gr.update(value=iframe_html),
+            gr.update(
+                value=pdf_path,
+                label="Download PDF",
+                interactive=True,
+            ),
+            state_val,
+        )
+        return
+
+    # ── First click — placeholder, generate, then iframe ────────────
+    # A2 placeholder: user sees "Generating PDF…" within ~50ms of the
+    # click instead of a blank iframe. Option 2: download button is
+    # DISABLED during the 1–3s generation window to avoid ambiguous
+    # "is this MD or PDF right now?" state.
+    placeholder_html = (
+        '<div style="display: flex; align-items: center; '
+        f'justify-content: center; height: {SUMMARY_HEIGHT}px; '
+        'opacity: 0.6; font-style: italic;">Generating PDF…</div>'
+    )
+    yield (
+        gr.update(value=placeholder_html),
+        gr.update(interactive=False),
+        state_val,
+    )
+
+    src_md = Path(md_path)
+    target_pdf = src_md.with_suffix(".pdf")
+    try:
+        md_to_pdf(src_md, target_pdf)
+    except Exception as e:
+        # Conversion failed. Show red error banner in the iframe slot,
+        # and fall the download button back to the .md (which is still
+        # valid and available).
+        err_html = (
+            '<div style="display: flex; align-items: center; '
+            f'justify-content: center; height: {SUMMARY_HEIGHT}px; '
+            f'color: #ef4444; padding: 0 16px; text-align: center;">'
+            f'PDF generation failed: {e}</div>'
+        )
+        yield (
+            gr.update(value=err_html),
+            gr.update(
+                value=md_path,
+                label="Download",
+                interactive=True,
+            ),
+            state_val,
+        )
+        return
+
+    state_val["final_summary_pdf_path"] = str(target_pdf)
+    iframe_html = (
+        f'<iframe src="/file={target_pdf}" '
+        f'style="width: 100%; height: {SUMMARY_HEIGHT}px; border: 0;" '
+        f'title="Meeting summary PDF"></iframe>'
+    )
+    yield (
+        gr.update(value=iframe_html),
+        gr.update(
+            value=str(target_pdf),
+            label="Download PDF",
+            interactive=True,
+        ),
+        state_val,
+    )
+
 
 def _materialize_input(src: str, dest_dir: Path) -> Path:
     """Resolve the ``file`` argument to a local file inside ``dest_dir``.
@@ -1667,7 +1813,7 @@ def build_demo() -> gr.Blocks:
                 elem_id="summary-container",
             ) as summary_section:
                 view_mode = gr.Radio(
-                    choices=["Rendered", "Raw"],
+                    choices=["Rendered", "Raw", "PDF"],
                     value="Rendered",
                     show_label=False,
                     container=False,
@@ -1692,6 +1838,16 @@ def build_demo() -> gr.Blocks:
                     show_label=False,
                     lines=SUMMARY_RAW_LINES,
                     max_lines=SUMMARY_RAW_LINES,
+                )
+
+                # M11: iframe slot for PDF view mode. Visible in the
+                # Python/Gradio sense at all times; CSS
+                # (.view-pdf on #summary-container) controls actual
+                # display. Populated by on_view_mode_pdf on demand.
+                final_summary_pdf = gr.HTML(
+                    value="",
+                    elem_id="final-summary-pdf",
+                    visible=True,
                 )
 
                 with gr.Row():
@@ -1766,12 +1922,22 @@ def build_demo() -> gr.Blocks:
             api_visibility="private",
         )
 
-        # Rendered/Raw toggle — pure JS, no Python roundtrip.
+        # Rendered/Raw/PDF toggle — two listeners stacked on the same
+        # event. The JS listener flips CSS classes (instant, no Python
+        # roundtrip). The Python listener (on_view_mode_pdf) handles
+        # PDF generation on demand + updates the download button's
+        # target. Gradio runs both in parallel.
         view_mode.change(
             fn=None,
             inputs=[view_mode],
             outputs=None,
             js=TOGGLE_VIEW_MODE_JS,
+        )
+        view_mode.change(
+            on_view_mode_pdf,
+            inputs=[view_mode, session_state],
+            outputs=[final_summary_pdf, download_btn, session_state],
+            api_visibility="private",
         )
 
         # When the rendered markdown's value changes (success yield sets

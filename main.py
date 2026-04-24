@@ -14,6 +14,7 @@ from ollama import Client
 
 # Import the core functions from our pipeline modules
 from pipeline import announce
+from pipeline.pdf_export import md_to_pdf
 from pipeline.step1_convert import convert
 from pipeline.step2_cleanup import clean_transcript
 from pipeline.step3_mapping import map_speakers
@@ -69,6 +70,17 @@ def main():
         help="Model used for Information Extraction (Step 4)",
     )
 
+    # Opt-in PDF export. Default off so scripts built against the
+    # pre-M11 CLI see zero behavioural change. When passed, the
+    # markdown-pdf conversion runs AFTER the pipeline's success
+    # signal — a conversion failure warns but does not flip the
+    # exit code.
+    parser.add_argument(
+        "--pdf",
+        action="store_true",
+        help="Also write a PDF alongside the markdown summary. Off by default.",
+    )
+
     args = parser.parse_args()
 
     if not args.input_file.exists():
@@ -122,7 +134,19 @@ def main():
 
         print("-" * 40)
         print(f"✅ Pipeline Complete! Final summary saved to:\n{final_path.absolute()}")
-        
+
+        # Opt-in PDF export (M11). Runs AFTER the success signal so
+        # the markdown is always the primary output; PDF is a bonus.
+        # Wrapped in its own try/except so a conversion failure logs
+        # a warning but does not flip the whole-pipeline exit code.
+        if args.pdf:
+            pdf_path = final_path.with_suffix(".pdf")
+            try:
+                md_to_pdf(final_path, pdf_path)
+                print(f"📄 PDF written to: {pdf_path.absolute()}")
+            except Exception as e:
+                print(f"⚠️  PDF generation failed (markdown is fine): {e}")
+
         print("\nEjecting models from VRAM...")
         client = Client(host=ollama_host)
         
